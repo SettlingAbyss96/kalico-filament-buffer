@@ -243,6 +243,88 @@ can't drift from them.
 - **Hardware:** `config/buffer-test.cfg` (`BUFFER_TEST_HELP` lists the steps), ending with
   `BUFFER_TEST_EXTRUDE`.
 
+## Design decisions
+
+The choices that shape everything else, with the reasoning behind each. The math is in
+[docs/CONTROL.md](docs/CONTROL.md).
+
+**Why is the control coordinate extrusion distance and not time?**
+
+The slider only moves when filament moves. What the buffer has to track is filament consumption,
+not elapsed seconds. So every rate, learning window and fault threshold is expressed per mm of
+extrusion:
+
+```math
+\frac{dx}{dE} = g\,m - 1
+```
+
+Time doesn't appear, which makes the controller insensitive to print speed, travel moves, pauses
+and dwells. A slow first layer and a fast infill section look the same to it, and a long travel
+can never be mistaken for a jam ([CONTROL.md, section 2](docs/CONTROL.md#2-plant-model)).
+
+**Why treat the buffer's spring and slack as part of the controller?**
+
+Because the buffer is a physical integrator. Its position is the running total of the mismatch
+between what the buffer feeds and what the extruder takes:
+
+```math
+x(E) = x_0 + \int (g\,m - 1)\,dE
+```
+
+Instead of treating the slack as an inconvenience to minimize, the design reads it as stored
+state. The mechanism itself integrates the feed error, and the Hall sensors sample that integral.
+That is what makes it possible to learn the ratio error from how long the slider spends on each
+side of the pos2 edge ([CONTROL.md, section 5](docs/CONTROL.md#5-learning-the-trim)).
+
+**Why calibrate against the extruder instead of an absolute measurement?**
+
+Neither the buffer's nor the extruder's `rotation_distance` has to represent a perfect physical
+millimeter. Calibration finds the transformation that makes the buffer agree with the toolhead:
+
+```math
+k = \frac{S_e}{S_b}, \qquad \mathrm{rd}_{new} = k \cdot \mathrm{rd}_{old}
+```
+
+where $S_e$ is in the extruder's commanded mm. If the extruder itself is 2% off, $S_e$ carries
+the same 2%, and the buffer ends up matching what the extruder really does. No ruler, no marked
+filament, and no dependence on how well the extruder was calibrated
+([CONTROL.md, section 9](docs/CONTROL.md#9-calibration)).
+
+**Why is there only one definition of "a millimeter of filament"?**
+
+The toolhead's extrusion coordinate is the reference for everything. The slicer, the motion
+planner and the extruder already agree on it. The buffer adapts to it (calibration, trim and
+multipliers all scale the buffer relative to $E$) rather than introducing a second, competing
+definition that the two motors would then disagree about.
+
+**What accuracy does the buffer actually need?**
+
+Relative flow accuracy, not absolute accuracy. To hold the slider at pos2 the buffer must deliver
+the same filament rate as the extruder within a narrow band:
+
+```math
+\frac{1}{1+\delta} < g < \frac{1}{1-\varepsilon} \qquad (\text{about } -2\% \text{ to } +1\%)
+```
+
+It never needs to know how many millimeters of filament really moved. The design solves this
+weaker, correct requirement rather than the harder problem of absolute filament metering, which
+the subsystem doesn't need.
+
+**How are feedforward and feedback split?**
+
+Feedforward does the bulk of the work: the buffer is synced to the extruder's motion, so it
+follows every extrusion, retraction and speed change exactly as they are planned, with no delay
+and no sensing involved. Feedback only handles what is left: the slider sensors adjust a
+multiplier within a few percent of 1, and the trim learns the slowly varying ratio error.
+
+```math
+\text{buffer feed} = \underbrace{\mathrm{d}E}_{\text{feedforward}} \times \underbrace{\tau\,m(z)}_{\text{feedback, near } 1}
+```
+
+Because the feedback only corrects a residual of a few percent, it can stay gentle. The control
+signal is a small multiplier applied to a motion that is already right, so the printer's motion
+is never interrupted by it.
+
 ## Credits
 
 The no-flush rate-change technique comes from [Belay](https://github.com/Annex-Engineering/Belay)
