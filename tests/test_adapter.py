@@ -2,10 +2,13 @@
 
 The key test is the hard rule: while printing, nothing the plugin does may
 touch the toolhead's motion queue (flush_step_generation, get_last_move_time,
-wait_moves, manual moves). Only the buffer's rotation distance may change.
+wait_moves, independent moves). Only the buffer's rotation distance may change.
+Independent moves go through BufferMover, replaced here by FakeMover; the real
+one is exercised on the printer.
 
 Run from the repo root:  python -m unittest discover -s tests -v
 """
+import contextlib
 import os
 import sys
 import unittest
@@ -65,6 +68,9 @@ class FakeGcode:
     def run_script_from_command(self, script):
         self.scripts.append(script)
 
+    def get_mutex(self):
+        return contextlib.nullcontext()
+
 
 class FakeButtons:
     def __init__(self):
@@ -72,6 +78,55 @@ class FakeButtons:
 
     def register_buttons(self, pins, callback):
         self.pins[pins[0]] = callback
+
+
+class FakeEndstop:
+    def __init__(self, pin):
+        self.pin = pin
+        self.steppers = []
+        self.triggered = False
+
+    def add_stepper(self, stepper):
+        self.steppers.append(stepper)
+
+    def query_endstop(self, print_time):
+        return self.triggered
+
+
+class FakePins:
+    def __init__(self):
+        self.multi_use = set()
+        self.endstops = {}
+
+    def allow_multi_use_pin(self, pin):
+        self.multi_use.add(pin)
+
+    def setup_pin(self, pin_type, pin):
+        assert pin_type == "endstop"
+        assert pin.lstrip("^~! ") in self.multi_use, "shared without allow_multi_use_pin"
+        self.endstops[pin] = FakeEndstop(pin)
+        return self.endstops[pin]
+
+
+class FakeMover:
+    """Stands in for BufferMover: records each independent move."""
+
+    def __init__(self, printer, config, stepper):
+        self.stepper = stepper
+        self.moves = []
+        self.results = []  # scripted (moved, triggered); default full move
+
+    def move(self, dist, speed, accel, endstop=None, name="sensor", abort=None):
+        self.moves.append(
+            {"dist": dist, "speed": speed, "endstop": name if endstop else None,
+             "abort": abort}
+        )
+        if self.results:
+            return self.results.pop(0)
+        return dist, False
+
+
+fb.BufferMover = FakeMover
 
 
 class FakeLookahead:
@@ -88,6 +143,7 @@ class FakeToolhead:
     def __init__(self):
         self.lookahead = FakeLookahead()
         self.calls = []
+        self.homed_axes = "xyz"
 
     def flush_step_generation(self):
         self.calls.append("flush_step_generation")
@@ -100,7 +156,7 @@ class FakeToolhead:
         self.calls.append("wait_moves")
 
     def get_status(self, eventtime):
-        return {"homed_axes": "xyz"}
+        return {"homed_axes": self.homed_axes}
 
     def get_position(self):
         return [0.0, 0.0, 50.0, 0.0]
@@ -122,7 +178,7 @@ class FakeStepper:
 class FakeExtruderStepper:
     def __init__(self, toolhead):
         self.toolhead = toolhead
-        self.stepper = FakeStepper(13.974)
+        self.stepper = FakeStepper(6.3)
         self.motion_queue = None
 
     def sync_to_extruder(self, name):
@@ -170,16 +226,6 @@ class FakePauseResume:
         self.pause_commands += 1
 
 
-class FakeForceMove:
-    def __init__(self, toolhead):
-        self.toolhead = toolhead
-        self.moves = []
-
-    def manual_move(self, stepper, dist, speed, accel=0.0):
-        self.toolhead.flush_step_generation()  # the real one flushes too
-        self.moves.append(dist)
-
-
 class FakeGcrq:
     def __init__(self):
         self.values = []
@@ -205,7 +251,7 @@ class FakePrinter:
             "extruder": FakeExtruder(),
             "print_stats": FakePrintStats(),
             "pause_resume": FakePauseResume(),
-            "force_move": FakeForceMove(self.toolhead),
+            "pins": FakePins(),
             "output_pin buffer_led_run": FakeOutputPin(),
             "output_pin buffer_led_err": FakeOutputPin(),
         }
@@ -329,7 +375,7 @@ class TestConfig(unittest.TestCase):
             "m_pos1", "m_approach_below", "m_below", "m_target", "m_above",
             "m_approach_above", "m_pos3", "tension_fault_mm",
             "compression_fault_mm", "trim_limit", "trim_gain", "trim_nudge",
-            "hover_stall_mm", "debounce_mm", "up_stay_flip_mm",
+            "hover_stall_mm", "debounce_mm", "up_stay_flip_mm", "overlap", "band_mm",
         ):
             self.assertEqual(getattr(buf.ctrl, attr), getattr(ref, attr), attr)
 
@@ -337,9 +383,21 @@ class TestConfig(unittest.TestCase):
         printer, _ = make_buffer()
         cmds = printer.objects["gcode"].commands
         for name in ("BUFFER_STATUS", "BUFFER_STATS", "BUFFER_SYNC", "BUFFER_UNSYNC",
-                     "BUFFER_MOVE", "BUFFER_SET", "BUFFER_TEST_EXTRUDE"):
+                     "BUFFER_MOVE", "BUFFER_LOAD", "BUFFER_CALIBRATE", "BUFFER_SET",
+                     "BUFFER_TEST_EXTRUDE"):
             self.assertIn(name, cmds)
         self.assertEqual(len(printer.objects["buttons"].pins), 6)
+
+    def test_pos2_and_pos3_double_as_endstops_on_the_buffer_motor(self):
+        printer, buf = make_buffer()
+        endstops = printer.objects["pins"].endstops
+        self.assertEqual(sorted(endstops), ["buffer:PB2", "buffer:PB3"])
+        for es in endstops.values():
+            self.assertEqual(es.steppers, [buf.mcu_stepper])
+
+    def test_bad_sensor_layout_is_a_config_error(self):
+        with self.assertRaises(CommandError):
+            make_buffer({"sensor_layout": "sideways"})
 
     def test_missing_required_pin_is_an_error(self):
         printer = FakePrinter()
@@ -391,19 +449,22 @@ class TestHardRule(unittest.TestCase):
         self.assertEqual(self.toolhead.calls, [], "the plugin touched the motion queue mid-print")
         self.assertGreater(len(self.stepper.rd_history), rd_changes_before,
                            "expected rate changes during the print")
-        self.assertEqual(self.printer.objects["force_move"].moves, [])
+        self.assertEqual(self.buf.mover.moves, [])
 
     def test_commands_that_would_stop_the_toolhead_are_refused_while_printing(self):
         cmds = self.printer.objects["gcode"].commands
         self.printer.objects["print_stats"].state = "printing"
         self.toolhead.lookahead.last = object()
         for name, params in (("BUFFER_MOVE", {"dist": 10}), ("BUFFER_UNSYNC", {}),
-                             ("BUFFER_SYNC", {}), ("BUFFER_TEST_EXTRUDE", {"dry_run": 1})):
+                             ("BUFFER_SYNC", {}), ("BUFFER_TEST_EXTRUDE", {"dry_run": 1}),
+                             ("BUFFER_LOAD", {}), ("BUFFER_CALIBRATE", {}),
+                             ("BUFFER_SET", {"rotation_distance": 6.3})):
             # UNSYNC only does anything when synced; SYNC only when unsynced
             self.buf.synced = name == "BUFFER_UNSYNC"
             with self.assertRaises(CommandError, msg=name):
                 cmds[name](FakeGcmd(**params))
         self.assertEqual(self.toolhead.calls, [])
+        self.assertEqual(self.buf.mover.moves, [])
         # Already synced: BUFFER_SYNC is a no-op and must not touch the toolhead
         self.buf.synced = True
         cmds["BUFFER_SYNC"](FakeGcmd())
@@ -413,6 +474,14 @@ class TestHardRule(unittest.TestCase):
         self.printer.objects["print_stats"].state = "printing"
         self.press("!buffer:PB12", 1)
         self.assertIsNone(self.buf.button_held)
+        self.assertEqual(self.printer.reactor.callbacks, [])
+
+    def test_no_autoload_while_printing_or_paused(self):
+        self.press("buffer:PB4", 1)  # slider at rest: empty path
+        for state in ("printing", "paused"):
+            self.printer.objects["print_stats"].state = state
+            self.press("!buffer:PB7", 1)
+            self.press("!buffer:PB7", 0)
         self.assertEqual(self.printer.reactor.callbacks, [])
 
     def test_fault_pauses_only_while_printing(self):
@@ -427,6 +496,126 @@ class TestHardRule(unittest.TestCase):
         self.tick(1.0)
         self.press("!buffer:PB7", 0)
         self.assertEqual(len(self.printer.reactor.callbacks), 1)
+
+
+class TestIdleMoves(unittest.TestCase):
+    def setUp(self):
+        self.printer, self.buf = make_buffer()
+        self.pins = self.printer.objects["buttons"].pins
+        self.cmds = self.printer.objects["gcode"].commands
+        self.mover = self.buf.mover
+
+    def press(self, pin, state):
+        self.printer.reactor.now += 0.05
+        self.pins[pin](self.printer.reactor.now, state)
+
+    def run_callbacks(self):
+        callbacks, self.printer.reactor.callbacks = self.printer.reactor.callbacks, []
+        for cb in callbacks:
+            cb(self.printer.reactor.now)
+
+    def test_inserting_filament_into_an_empty_path_starts_a_load(self):
+        self.press("buffer:PB4", 1)  # slider at rest
+        self.press("!buffer:PB7", 1)  # filament inserted
+        self.assertEqual(len(self.printer.reactor.callbacks), 1)
+        self.run_callbacks()
+        self.assertIn("BUFFER_LOAD", self.printer.objects["gcode"].scripts)
+
+    def test_no_autoload_when_the_path_is_not_empty_or_disabled(self):
+        self.press("!buffer:PB7", 1)  # pos1 not blocked: filament already in
+        self.assertEqual(self.printer.reactor.callbacks, [])
+        printer, buf = make_buffer({"autoload": "False"})
+        pins = printer.objects["buttons"].pins
+        pins["buffer:PB4"](100.1, 1)
+        pins["!buffer:PB7"](100.2, 1)
+        self.assertEqual(printer.reactor.callbacks, [])
+
+    def test_load_feeds_slowly_then_fast_and_stops_at_pos2(self):
+        self.press("buffer:PB4", 1)
+        self.press("!buffer:PB7", 1)
+        self.mover.results = [(20.0, False), (845.0, True)]
+        gcmd = FakeGcmd()
+        self.cmds["BUFFER_LOAD"](gcmd)
+        first, second = self.mover.moves
+        self.assertEqual((first["endstop"], second["endstop"]), ("pos2", "pos2"))
+        self.assertLess(first["speed"], second["speed"])
+        self.assertIn("865 mm", gcmd.responses[-1])
+        self.assertEqual(self.buf.last_load_mm, 865.0)
+
+    def test_load_refusals(self):
+        with self.assertRaises(CommandError):
+            self.cmds["BUFFER_LOAD"](FakeGcmd())  # no filament at the inlet
+        self.press("!buffer:PB7", 1)
+        self.buf.synced = True
+        with self.assertRaises(CommandError):
+            self.cmds["BUFFER_LOAD"](FakeGcmd())
+        self.buf.synced = False
+        self.mover.results = [(20.0, False), (1480.0, False)]
+        with self.assertRaises(CommandError):  # pos2 never reached
+            self.cmds["BUFFER_LOAD"](FakeGcmd())
+
+    def test_a_button_cancels_a_load(self):
+        self.press("!buffer:PB7", 1)
+        self.buf.loading = True
+        self.press("!buffer:PB13", 1)
+        self.assertTrue(self.buf.load_cancel)
+        self.assertTrue(self.buf._load_abort())
+        self.assertEqual(self.printer.reactor.callbacks, [])
+
+    def test_feed_button_moves_until_released_and_stops_at_pos3(self):
+        self.press("!buffer:PB12", 1)
+        self.run_callbacks()
+        (move,) = self.mover.moves
+        self.assertGreater(move["dist"], 0.0)
+        self.assertEqual(move["endstop"], "pos3")
+        self.assertFalse(move["abort"]())
+        self.press("!buffer:PB12", 0)
+        self.assertTrue(move["abort"]())
+
+    def test_retract_button_has_no_endstop(self):
+        self.press("!buffer:PB13", 1)
+        self.run_callbacks()
+        (move,) = self.mover.moves
+        self.assertLess(move["dist"], 0.0)
+        self.assertIsNone(move["endstop"])
+
+    def test_buffer_move_feeding_stops_at_pos3(self):
+        self.cmds["BUFFER_MOVE"](FakeGcmd(dist=30))
+        self.cmds["BUFFER_MOVE"](FakeGcmd(dist=-30))
+        self.assertEqual([m["endstop"] for m in self.mover.moves], ["pos3", None])
+
+    def test_set_rotation_distance_when_idle(self):
+        self.cmds["BUFFER_SET"](FakeGcmd(rotation_distance=6.3))
+        self.assertEqual(self.buf.base_rd, 6.3)
+        self.assertEqual(self.buf.mcu_stepper.rd, 6.3)
+
+    def test_extrude_test_requires_homing_unless_check_z_0(self):
+        self.press("!buffer:PB7", 1)
+        self.printer.toolhead.homed_axes = ""
+        with self.assertRaises(CommandError) as ctx:
+            self.cmds["BUFFER_TEST_EXTRUDE"](FakeGcmd())
+        self.assertIn("CHECK_Z=0", str(ctx.exception))
+        gcmd = FakeGcmd(check_z=0, length=30)
+        self.cmds["BUFFER_TEST_EXTRUDE"](gcmd)
+        self.assertTrue(any("RESULT" in r for r in gcmd.responses))
+
+
+class TestCalibrationMath(unittest.TestCase):
+    def test_ratio_and_geometry_from_edges(self):
+        # numbers from the measurement on the real buffer (2026-10-04)
+        up = {("pos1", False): 0.75, ("pos2", True): 21.75, ("pos3", True): 31.75}
+        down = {("pos3", False): 0.12, ("pos2", False): 4.38, ("pos1", True): 14.12}
+        ratio, geo = fb.calibration_result(up, down)
+        self.assertAlmostEqual(ratio, 14.0 / 31.0)
+        self.assertAlmostEqual(geo["gap_mm"], 21.0 * ratio)
+        self.assertAlmostEqual(geo["band_mm"], 10.0 * ratio)
+        self.assertTrue(geo["overlap"])
+
+    def test_edges_out_of_order_are_rejected(self):
+        up = {("pos1", False): 5.0, ("pos3", True): 4.0}
+        down = {("pos3", False): 0.0, ("pos1", True): 10.0}
+        with self.assertRaises(ValueError):
+            fb.calibration_result(up, down)
 
 
 if __name__ == "__main__":

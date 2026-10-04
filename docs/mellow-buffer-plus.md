@@ -1,7 +1,8 @@
 # Mellow Fly LLL Buffer Plus as a Kalico MCU
 
 How the buffer was converted from Mellow's standalone firmware to a Kalico MCU, and everything
-learned about its hardware. Done and verified on a Voron 2.4 on 2026-10-03.
+learned about its hardware. Done and verified on a Voron 2.4 on 2026-10-03; feed distance and
+sensor geometry measured on 2026-10-04.
 
 ## Hardware facts
 
@@ -12,6 +13,7 @@ learned about its hardware. Done and verified on a Voron 2.4 on 2026-10-03.
 | USB | PA11/PA12 (native, no remap) |
 | Power | 12–24 V on VIN. USB is used for data. **Don't hot-plug USB into the Pi while the printer runs**: plugging this 24 V-powered board in once dropped the printer's other USB devices (mainboard and CAN adapter) and needed a power cycle. A data-only cable (5 V not connected) is recommended |
 | Stock firmware | open source, PlatformIO/Arduino: https://github.com/FLY3DTeam/Buffer |
+| Feed per motor turn | **6.30 mm** (`rotation_distance` at 16 microsteps), measured against the extruder. The stock firmware never states it: it runs the motor by speed (260 rpm by default), and its `steps 916` setting is the printer's extruder steps per mm, which it counts for jam detection. Taking 916 as the buffer's own value gives 13.97, which feeds only 45% of what is commanded |
 
 ## Pin map (from the stock source, verified on hardware)
 
@@ -28,6 +30,11 @@ learned about its hardware. Done and verified on a Voron 2.4 on 2026-10-03.
 | Feed / retract buttons | PB12 / PB13 | low = pressed |
 | LEDs | PA8 (blue) / PA15 (red) | |
 | Runout output | PB15 | stock firmware's signal to a mainboard; unused under Kalico |
+
+**Slider sensors overlap.** pos1 is blocked over the first ~19 mm of slider travel (the rest end),
+then nothing for 9.6 mm, then pos2 from 28.6 mm, and pos3 from 33.0 mm while pos2 stays blocked.
+Only near the end stop does pos2 clear again. Use `sensor_layout: overlap` (the default); the
+geometry table is in [DESIGN.md](DESIGN.md#the-buffer-as-the-controller-sees-it).
 
 **Configure the driver as a TMC2208.** Configured as a TMC2209 it still runs, but `IOIN` decodes
 wrongly (`enn` appears stuck at 0 and `diag` toggles with PA6). As `[tmc2208 ...]` Kalico decodes it as
@@ -65,7 +72,8 @@ after testing.
    It reboots as `usb-Klipper_stm32f072xb_<id>`. Future updates need no buttons:
    `flashtool.py -d <Klipper serial> -r`, then the same flash command.
 4. **Configure:** `config/mellow-buffer-plus.cfg`, then run the hardware tests in
-   `config/buffer-test.cfg` (`BUFFER_TEST_HELP`).
+   `config/buffer-test.cfg` (`BUFFER_TEST_HELP`). With filament loaded through the extruder,
+   `BUFFER_CALIBRATE` measures your buffer's `rotation_distance`.
 
 ## Restoring the stock firmware
 

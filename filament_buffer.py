@@ -10,6 +10,7 @@
 # Design: docs/DESIGN.md - https://github.com/SettlingAbyss96/kalico-filament-buffer
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import importlib
 import logging
 import math
 
@@ -17,8 +18,12 @@ UPDATE_INTERVAL = 0.1  # seconds between extruder position samples
 DIRECTION_WINDOW = 0.3  # seconds of extruder history used for direction
 DIRECTION_DEADBAND = 0.05  # mm of net extruder motion treated as "stopped"
 MIN_RATE_CHANGE_INTERVAL = 0.2  # seconds between applied rate changes
-TEST_POS3_ABORT_MM = 15.0  # BUFFER_TEST_EXTRUDE: held at pos3 this long -> abort
-TEST_POS1_ABORT_MM = 40.0  # BUFFER_TEST_EXTRUDE: held at pos1 this long -> abort
+TEST_POS3_ABORT_MM = 25.0  # BUFFER_TEST_EXTRUDE: held at pos3 this long -> abort
+TEST_POS1_ABORT_MM = 70.0  # BUFFER_TEST_EXTRUDE: held at pos1 this long -> abort
+JOG_MAX_MM = 2000.0  # longest single independent move (buttons, BUFFER_MOVE)
+LOAD_INLET_GRACE = 0.3  # seconds the inlet may read empty before a load stops
+SENSOR_SETTLE = 0.15  # seconds for sensor reports to arrive after a move
+CALIBRATE_SPREAD = 0.04  # BUFFER_CALIBRATE: runs must agree within 4%
 
 ZONE_POS1 = "pos1"
 ZONE_BELOW = "below"
@@ -41,6 +46,12 @@ class FeedController:
     Zones: pos1 (spring relaxed) < below < pos2 (target) < above < pos3.
     'below'/'above' run in approach mode (strong correction) when entered
     from a hard sensor, and in hover mode (gentle) when entered from pos2.
+
+    overlap=True is the Mellow LLL Buffer Plus layout: pos2 stays blocked
+    from its lower edge up through pos3, so there is no 'above' zone and
+    pos2 clearing (with pos3 clear) always means the slider went down.
+    Coming down from pos3, pos2 runs in approach mode until its lower edge.
+    With overlap=False the three sensors are separate windows.
     """
 
     def __init__(
@@ -52,15 +63,22 @@ class FeedController:
         m_above=0.98,
         m_approach_above=0.85,
         m_pos3=0.30,
-        tension_fault_mm=25.0,
-        compression_fault_mm=15.0,
+        tension_fault_mm=60.0,
+        compression_fault_mm=25.0,
         trim_limit=0.05,
         trim_gain=0.5,
         trim_nudge=0.01,
         hover_stall_mm=60.0,
         debounce_mm=0.3,
         up_stay_flip_mm=300.0,
+        overlap=True,
+        band_mm=4.4,
     ):
+        self.overlap = overlap
+        # overlap layout: filament mm from the lower edge of pos2 to pos3
+        # (BUFFER_CALIBRATE measures it); 0 disables learning from it
+        self.band_mm = band_mm
+        self.band_entry = False  # current pos2 stay began at its lower edge
         self.m_pos1 = m_pos1
         self.m_approach_below = m_approach_below
         self.m_below = m_below
@@ -125,7 +143,8 @@ class FeedController:
         if z == ZONE_POS3:
             return self.m_pos3
         if z == ZONE_POS2:
-            return self.m_target
+            # approach mode here means coming down from pos3 (overlap layout)
+            return self.m_approach_above if self.approach else self.m_target
         if z == ZONE_BELOW:
             return self.m_approach_below if self.approach else self.m_below
         if z == ZONE_ABOVE:
@@ -146,6 +165,7 @@ class FeedController:
         self.pending.clear()
         self.sensors.update(self.raw)
         s = self.sensors
+        approach = False
         if s["pos1"] and s["pos3"]:
             zone = ZONE_UNKNOWN
         elif s["pos1"]:
@@ -154,9 +174,12 @@ class FeedController:
             zone = ZONE_POS3
         elif s["pos2"]:
             zone = ZONE_POS2
+        elif self.overlap:
+            # nothing blocked can only be the gap between pos1 and pos2
+            zone, approach = ZONE_BELOW, True
         else:
             zone = ZONE_UNKNOWN
-        self._enter(zone, e_pos, approach=False, learn=False)
+        self._enter(zone, e_pos, approach=approach, learn=False)
         self.last_e = e_pos
 
     def set_faults_enabled(self, enabled, e_pos):
@@ -175,7 +198,9 @@ class FeedController:
             # Hard sensor hits: correct the belief, and the trim only when
             # the correct-side hover rate failed to hold the slider
             if zone == ZONE_POS3:
-                if prev == ZONE_ABOVE:
+                if prev == ZONE_POS2 and not prev_approach and self._learn_from_rise(prev_mm):
+                    pass
+                elif prev == ZONE_ABOVE or (prev == ZONE_POS2 and not prev_approach):
                     self._nudge_trim(-self.trim_nudge)
                 elif prev == ZONE_BELOW and self.stall_nudge > 0.0:
                     # the stall nudge was based on the wrong side: undo it
@@ -191,8 +216,13 @@ class FeedController:
                 self.stall_nudge = 0.0
             elif zone == ZONE_POS2:
                 self.stall_nudge = 0.0
-            # Auto-trim from clean hover cycles at either edge of pos2
-            if prev == ZONE_POS2 and zone in (ZONE_BELOW, ZONE_ABOVE):
+            # Auto-trim from clean hover cycles at either edge of pos2 (a
+            # pos2 stay in approach mode is a descent from pos3, not a hover)
+            if (
+                prev == ZONE_POS2
+                and not prev_approach
+                and zone in (ZONE_BELOW, ZONE_ABOVE)
+            ):
                 self.cycle_pos2_mm = prev_mm
             elif (
                 prev in (ZONE_BELOW, ZONE_ABOVE)
@@ -218,9 +248,26 @@ class FeedController:
             # snapshots so behavior after reaching pos2 can be judged alone
             st["zone_mm_at_pos2"] = dict(st["zone_mm"])
             st["zone_entries_at_pos2"] = dict(st["zone_entries"])
+        self.band_entry = zone == ZONE_POS2 and prev == ZONE_BELOW and learn
         self.zone = zone
         self.approach = approach
         self.zone_entry_e = e_pos
+
+    def _learn_from_rise(self, p2_mm):
+        """Overlap layout: the slider entered pos2 at its lower edge and rose
+        through the whole band to pos3 while feeding at m_target. The band
+        width over the extrusion it took is the remaining feed excess, so
+        the trim can be set to zero error in one step. Overshooting low is
+        harmless (it then hovers at the lower edge and learns from cycles);
+        an undershoot just means another, slower, rise."""
+        if not (self.overlap and self.band_entry and self.band_mm > 0.0 and p2_mm):
+            return False
+        rise = self.band_mm / p2_mm
+        if rise > 2.0 * self.trim_limit + (1.0 - self.m_target):
+            return False  # too fast to be a ratio error: a disturbance
+        self._nudge_trim(self.m_target / (1.0 + rise) - 1.0)
+        self.trim_updates += 1
+        return True
 
     def _learn_from_cycle(self, side, p2_mm, side_mm):
         """One clean hover cycle (pos2 -> side -> pos2) reveals the remaining
@@ -304,15 +351,22 @@ class FeedController:
             if state:
                 zone = ZONE_POS3
             elif s["pos2"]:
-                zone = ZONE_POS2
+                # Left pos3 downward. With overlapping sensors the slider is
+                # now somewhere in pos2: keep relieving until its lower edge.
+                zone, approach = ZONE_POS2, self.overlap
             else:
                 zone, approach = ZONE_ABOVE, True
         elif state:  # pos2 rising
-            zone = ZONE_POS2
+            # with pos3 still blocked the slider is coming down from the top
+            zone = ZONE_POS3 if s["pos3"] else ZONE_POS2
         elif s["pos1"]:
             zone = ZONE_POS1
         elif s["pos3"]:
             zone = ZONE_POS3
+        elif self.overlap:
+            # pos2 covers everything from its lower edge up through pos3, so
+            # clearing with pos3 clear can only mean the slider went down
+            zone = ZONE_BELOW
         else:
             # pos2 falling: which side did the slider leave on? Inside pos2
             # the multiplier is below 1, so with the trim tuned the slider
@@ -396,6 +450,202 @@ class FeedController:
         self.fault = self._new_fault = None
 
 
+def calibration_result(b, e):
+    """BUFFER_CALIBRATE math. b: buffer positions (commanded mm) of the
+    sensor edges while the buffer pushed the slider up with the extruder
+    holding; e: extruder positions (mm) of the edges while the extruder
+    pulled it back down with the buffer holding. Keys are (sensor, state).
+
+    The span from leaving pos1 to reaching pos3 is the same both ways (each
+    sensor's hysteresis is on its clearing side), so the buffer's true feed
+    per commanded mm is the extruder span over the buffer span."""
+    b_span = b[("pos3", True)] - b[("pos1", False)]
+    e_span = e[("pos1", True)] - e[("pos3", False)]
+    if b_span <= 0.0 or e_span <= 0.0:
+        raise ValueError("sensor edges out of order")
+    ratio = e_span / b_span
+    geometry = {"span_mm": e_span}
+    if ("pos2", True) in b:
+        geometry["gap_mm"] = (b[("pos2", True)] - b[("pos1", False)]) * ratio
+        geometry["band_mm"] = (b[("pos3", True)] - b[("pos2", True)]) * ratio
+    # overlapping layout: pos2 never cleared on the way up to pos3
+    geometry["overlap"] = ("pos2", False) not in b
+    return ratio, geometry
+
+
+######################################################################
+# Independent buffer moves (idle only)
+######################################################################
+
+
+def _klippy_module(name):
+    try:
+        return importlib.import_module("klippy." + name)
+    except ImportError:
+        return importlib.import_module(name)
+
+
+def _move_time(dist, speed, accel):
+    """Trapezoid timing for one move (same as force_move.calc_move_time)."""
+    axis_r = -1.0 if dist < 0.0 else 1.0
+    dist = abs(dist)
+    if not accel or not dist:
+        return axis_r, 0.0, dist / speed, speed
+    if dist * accel < speed * speed:
+        speed = math.sqrt(dist * accel)
+    accel_t = speed / accel
+    return axis_r, accel_t, (dist - accel_t * speed) / speed, speed
+
+
+class _AbortableCompletion:
+    """A drip move ends when its completion is done; this one is also done
+    when abort() returns True."""
+
+    def __init__(self, inner, abort):
+        self.inner = inner
+        self.abort = abort
+
+    def test(self):
+        return self.inner.test() or (self.abort is not None and bool(self.abort()))
+
+    def wait(self, *args, **kwargs):
+        return self.inner.wait(*args, **kwargs)
+
+
+class _TriggerRecorder:
+    """Passes everything through to an endstop and remembers the trigger
+    time home_wait reports (0 when it did not trigger)."""
+
+    def __init__(self, endstop):
+        self._endstop = endstop
+        self.trigger_time = 0.0
+
+    def __getattr__(self, name):
+        return getattr(self._endstop, name)
+
+    def home_wait(self, home_end_time):
+        self.trigger_time = self._endstop.home_wait(home_end_time)
+        return self.trigger_time
+
+
+class BufferMover:
+    """Moves the buffer motor on its own while it is unsynced (never while
+    printing). A move can end early: when an endstop on a slider sensor
+    triggers (the buffer MCU stops the motor itself, so the stop is exact),
+    or when abort() returns True (checked about every 0.1 s, e.g. a released
+    button). This is the toolhead-like interface manual_stepper offers for
+    homing, applied to the extruder_stepper's motor."""
+
+    def __init__(self, printer, config, stepper):
+        self.printer = printer
+        self.reactor = printer.get_reactor()
+        self.stepper = stepper
+        self.motion_queuing = printer.load_object(config, "motion_queuing")
+        self.trapq = self.motion_queuing.allocate_trapq()
+        self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        ffi_main, ffi_lib = _klippy_module("chelper").get_ffi()
+        self.sk = ffi_main.gc(ffi_lib.cartesian_stepper_alloc(b"x"), ffi_lib.free)
+        self.toolhead = None
+        self.next_cmd_time = 0.0
+        self.commanded_pos = 0.0
+        self.accel = 0.0
+        self.abort = None
+        self.prev = None
+
+    def move(self, dist, speed, accel, endstop=None, name="sensor", abort=None):
+        """Returns (mm actually moved, endstop triggered)."""
+        self.toolhead = self.printer.lookup_object("toolhead")
+        self._attach()
+        start = self.stepper.get_mcu_position()
+        triggered = False
+        self.accel, self.abort = accel, abort
+        try:
+            target = [dist, 0.0, 0.0, 0.0]
+            if endstop is None:
+                self.drip_move(target, speed, self.reactor.completion())
+            else:
+                homing = _klippy_module("extras.homing")
+                recorder = _TriggerRecorder(endstop)
+                hmove = homing.HomingMove(self.printer, [(recorder, name)], self)
+                hmove.homing_move(target, speed, triggered=True, check_triggered=False)
+                triggered = recorder.trigger_time > 0.0
+        finally:
+            self.abort = None
+            self._detach()
+        moved = (self.stepper.get_mcu_position() - start) * self.stepper.get_step_dist()
+        return moved, triggered
+
+    def _attach(self):
+        self.toolhead.flush_step_generation()
+        prev_sk = self.stepper.set_stepper_kinematics(self.sk)
+        prev_tq = self.stepper.set_trapq(self.trapq)
+        self.prev = (prev_sk, prev_tq)
+        self.commanded_pos = 0.0
+        self.stepper.set_position([0.0, 0.0, 0.0])
+        self.next_cmd_time = 0.0
+
+    def _detach(self):
+        self.toolhead.flush_step_generation()
+        prev_sk, prev_tq = self.prev
+        self.stepper.set_trapq(prev_tq)
+        self.stepper.set_stepper_kinematics(prev_sk)
+        self.motion_queuing.wipe_trapq(self.trapq)
+
+    # --- toolhead-like interface used by HomingMove ------------------------
+    def sync_print_time(self):
+        print_time = self.toolhead.get_last_move_time()
+        if self.next_cmd_time > print_time:
+            self.toolhead.dwell(self.next_cmd_time - print_time)
+        else:
+            self.next_cmd_time = print_time
+
+    def flush_step_generation(self):
+        self.toolhead.flush_step_generation()
+
+    def get_position(self):
+        return [self.commanded_pos, 0.0, 0.0, 0.0]
+
+    def set_position(self, newpos, homing_axes=""):
+        self.toolhead.flush_step_generation()
+        self.commanded_pos = newpos[0]
+        self.stepper.set_position([self.commanded_pos, 0.0, 0.0])
+
+    def get_last_move_time(self):
+        self.sync_print_time()
+        return self.next_cmd_time
+
+    def dwell(self, delay):
+        self.next_cmd_time += max(0.0, delay)
+
+    def drip_move(self, newpos, speed, drip_completion):
+        self.sync_print_time()
+        start_time = self.next_cmd_time
+        cp = self.commanded_pos
+        axis_r, accel_t, cruise_t, cruise_v = _move_time(newpos[0] - cp, speed, self.accel)
+        self.trapq_append(
+            self.trapq, start_time, accel_t, cruise_t, accel_t,
+            cp, 0.0, 0.0, axis_r, 0.0, 0.0, 0.0, cruise_v, self.accel,
+        )
+        self.commanded_pos = newpos[0]
+        end_time = start_time + 2.0 * accel_t + cruise_t
+        self.motion_queuing.drip_update_time(
+            start_time, end_time, _AbortableCompletion(drip_completion, self.abort)
+        )
+        # Clear what is left of the move if it stopped early
+        self.motion_queuing.wipe_trapq(self.trapq)
+        self.stepper.set_position([self.commanded_pos, 0.0, 0.0])
+        self.sync_print_time()
+
+    def get_kinematics(self):
+        return self
+
+    def get_steppers(self):
+        return [self.stepper]
+
+    def calc_position(self, stepper_positions):
+        return [stepper_positions[self.stepper.get_name()], 0.0, 0.0]
+
+
 ######################################################################
 # Kalico adapter
 ######################################################################
@@ -410,10 +660,26 @@ class FilamentBuffer:
         self.stepper_name = config.get("extruder_stepper", "buffer")
         self.extruder_name = config.get("extruder", "extruder")
         self.report_events = config.getboolean("report_events", True)
-        self.button_step = config.getfloat("button_step", 10.0, above=0.0)
         self.button_speed = config.getfloat("button_speed", 20.0, above=0.0)
         self.max_move_speed = config.getfloat("max_move_speed", 60.0, above=0.0)
         self.move_accel = config.getfloat("move_accel", 500.0, minval=0.0)
+        # Loading (autoload on insert, or BUFFER_LOAD): feed until the slider
+        # reaches pos2, which means the tip is pressed against the extruder
+        self.autoload = config.getboolean("autoload", True)
+        self.autoload_delay = config.getfloat("autoload_delay", 1.0, minval=0.0)
+        self.load_speed = config.getfloat(
+            "load_speed", 30.0, above=0.0, maxval=self.max_move_speed
+        )
+        self.load_max_mm = config.getfloat(
+            "load_max_mm", 1500.0, above=0.0, maxval=JOG_MAX_MM
+        )
+        self.load_grab_mm = config.getfloat("load_grab_mm", 20.0, minval=0.0)
+        self.load_grab_speed = config.getfloat(
+            "load_grab_speed", 10.0, above=0.0, maxval=self.max_move_speed
+        )
+        layout = config.get("sensor_layout", "overlap")
+        if layout not in ("overlap", "separate"):
+            raise config.error("sensor_layout must be 'overlap' or 'separate'")
         # Defaults come from FeedController itself (the values the offline
         # simulation suite validates), so config and tests can't drift apart
         d = FeedController()
@@ -449,6 +715,8 @@ class FilamentBuffer:
             up_stay_flip_mm=config.getfloat(
                 "up_stay_flip_mm", d.up_stay_flip_mm, above=0.0
             ),
+            overlap=layout == "overlap",
+            band_mm=config.getfloat("band_mm", d.band_mm, minval=0.0),
         )
         # Pins: all on the buffer MCU. state True = blocked/present/pressed
         self.pin_states = {}
@@ -469,10 +737,22 @@ class FilamentBuffer:
             buttons.register_buttons(
                 [pin], (lambda et, st, k=key: self._pin_event(k, et, st))
             )
+        # pos2 and pos3 double as endstops for idle moves: the buffer MCU
+        # stops the motor the moment the slider gets there
+        ppins = self.printer.lookup_object("pins")
+        pes = self.printer.load_object(config, "extruder_stepper " + self.stepper_name)
+        stepper = pes.extruder_stepper.stepper
+        self.endstops = {}
+        for key in ("pos2", "pos3"):
+            pin = config.get(key + "_pin")
+            ppins.allow_multi_use_pin(pin.lstrip("^~! "))
+            endstop = ppins.setup_pin("endstop", pin)
+            endstop.add_stepper(stepper)
+            self.endstops[key] = endstop
+        self.mover = BufferMover(self.printer, config, stepper)
         self.ok_led_name = config.get("ok_led", None)
         self.fault_led_name = config.get("fault_led", None)
         self.printer.load_object(config, "pause_resume")
-        self.printer.load_object(config, "force_move")
         # Runtime state
         self.synced = False
         self.applied_mult = 1.0
@@ -483,10 +763,15 @@ class FilamentBuffer:
         self.pause_pending = False
         self.button_held = None
         self.button_loop_running = False
+        self.loading = False
+        self.load_cancel = False
+        self.inlet_clear_since = None
+        self.last_load_mm = None
+        self.edge_log = None  # (sensor, state, eventtime) while calibrating
         self.toolhead = self.extruder = self.mcu = None
         self.es = self.mcu_stepper = None
         self.base_rd = None
-        self.print_stats = self.pause_resume = self.force_move = None
+        self.print_stats = self.pause_resume = None
         self.leds = {}
         self.update_timer = self.reactor.register_timer(self._update)
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
@@ -497,6 +782,8 @@ class FilamentBuffer:
             "BUFFER_SYNC",
             "BUFFER_UNSYNC",
             "BUFFER_MOVE",
+            "BUFFER_LOAD",
+            "BUFFER_CALIBRATE",
             "BUFFER_SET",
             "BUFFER_TEST_EXTRUDE",
         ):
@@ -517,7 +804,6 @@ class FilamentBuffer:
         self.base_rd = self.mcu_stepper.get_rotation_distance()[0]
         self.print_stats = self.printer.lookup_object("print_stats")
         self.pause_resume = self.printer.lookup_object("pause_resume")
-        self.force_move = self.printer.lookup_object("force_move")
         for led in (self.ok_led_name, self.fault_led_name):
             if led:
                 self.leds[led] = self.printer.lookup_object("output_pin " + led)
@@ -623,6 +909,8 @@ class FilamentBuffer:
     def _pin_event(self, key, eventtime, state):
         try:
             self.pin_states[key] = bool(state)
+            if self.edge_log is not None and key in ("pos1", "pos2", "pos3"):
+                self.edge_log.append((key, bool(state), eventtime))
             if self.report_events:
                 labels = {
                     "inlet": ("absent", "present"),
@@ -648,7 +936,9 @@ class FilamentBuffer:
                 self._apply_rate(eventtime)
             elif key == "inlet":
                 self._update_leds()
-                if not state and self.synced and self.mcu is not None:
+                if state:
+                    self._maybe_autoload(eventtime)
+                elif self.synced and self.mcu is not None:
                     # arm/disarm now rather than waiting for the next tick
                     self.ctrl.set_faults_enabled(
                         self._faults_should_be_enabled(), self._extruder_pos(eventtime)
@@ -710,7 +1000,7 @@ class FilamentBuffer:
         finally:
             self.pause_pending = False
 
-    # --- buttons (only when not printing) --------------------------------
+    # --- buttons and autoload (only when not printing) -------------------
     def _button(self, key, state):
         if not state:
             if self.button_held == key:
@@ -719,24 +1009,92 @@ class FilamentBuffer:
         if self._is_printing():
             self._respond("%s ignored while printing" % key)
             return
+        if self.loading:
+            self.load_cancel = True
+            return
         self.button_held = key
         if not self.button_loop_running:
             self.button_loop_running = True
             self.reactor.register_callback(self._button_loop)
 
     def _button_loop(self, eventtime):
+        # One continuous move for as long as the button is held. FEED stops
+        # by itself at pos3 (fully compressed), so holding it too long can't
+        # push the tube out of its fitting.
         try:
-            while self.button_held is not None and not self._is_printing():
-                step = self.button_step
-                if self.button_held == "key_retract":
-                    step = -step
-                self.gcode.run_script(
-                    "BUFFER_MOVE DIST=%.3f SPEED=%.3f" % (step, self.button_speed)
+            with self.gcode.get_mutex():
+                key = self.button_held
+                if key is None or self._is_printing():
+                    return
+                feed = key == "key_feed"
+                moved, at_pos3 = self._idle_move(
+                    JOG_MAX_MM if feed else -JOG_MAX_MM,
+                    self.button_speed,
+                    endstop_key="pos3" if feed else None,
+                    abort=lambda: self.button_held != key or self._is_printing(),
                 )
+                if at_pos3:
+                    self._respond("feed stopped at pos3 (slider fully compressed)")
         except Exception:
             logging.exception("filament_buffer: error in button move")
         finally:
             self.button_loop_running = False
+
+    def _maybe_autoload(self, eventtime):
+        if not self.autoload or self.synced or self.loading:
+            return
+        if self._print_state() in ("printing", "paused"):
+            return
+        # Only into an empty path: the slider rests at pos1 with no filament
+        if not self.pin_states.get("pos1"):
+            return
+        self.reactor.register_callback(self._autoload, eventtime + self.autoload_delay)
+
+    def _autoload(self, eventtime):
+        try:
+            if not self.pin_states.get("inlet") or not self.pin_states.get("pos1"):
+                return
+            if self.synced or self.loading or self._print_state() in ("printing", "paused"):
+                return
+            self._respond("filament detected, loading it to the extruder")
+            self.gcode.run_script("BUFFER_LOAD")
+        except Exception as e:
+            logging.exception("filament_buffer: autoload")
+            self.gcode.respond_raw("!! buffer: autoload: %s" % (e,))
+
+    def _load_abort(self):
+        if self.load_cancel or self._is_printing():
+            return True
+        if self.pin_states.get("inlet"):
+            self.inlet_clear_since = None
+            return False
+        now = self.reactor.monotonic()
+        if self.inlet_clear_since is None:
+            self.inlet_clear_since = now
+        return now - self.inlet_clear_since > LOAD_INLET_GRACE
+
+    def _idle_move(self, dist, speed, endstop_key=None, abort=None):
+        """Independent buffer move (caller ensures not printing). Unsyncs
+        for the move and resyncs after. Returns (mm moved, endstop hit)."""
+        was_synced = self.synced
+        if was_synced:
+            self._do_sync(False)
+        try:
+            return self.mover.move(
+                dist,
+                speed,
+                self.move_accel,
+                endstop=self.endstops.get(endstop_key),
+                name=endstop_key or "",
+                abort=abort,
+            )
+        finally:
+            if was_synced:
+                self._do_sync(True)
+
+    def _settle(self):
+        """Let sensor reports from the end of a move arrive."""
+        self.reactor.pause(self.reactor.monotonic() + SENSOR_SETTLE)
 
     # --- commands --------------------------------------------------------
     cmd_BUFFER_STATUS_help = "Report the filament buffer state"
@@ -791,8 +1149,8 @@ class FilamentBuffer:
         gcmd.respond_info("buffer: unsynced")
 
     cmd_BUFFER_MOVE_help = (
-        "Move the buffer motor on its own: DIST=<mm> [SPEED=] [ACCEL=]."
-        " Not while printing."
+        "Move the buffer motor on its own: DIST=<mm> [SPEED=]. Feeding stops"
+        " early at pos3. Not while printing."
     )
 
     def cmd_BUFFER_MOVE(self, gcmd):
@@ -801,26 +1159,230 @@ class FilamentBuffer:
         speed = gcmd.get_float(
             "SPEED", self.button_speed, above=0.0, maxval=self.max_move_speed
         )
-        accel = gcmd.get_float("ACCEL", self.move_accel, minval=0.0)
-        if abs(dist) > 2000.0:
-            raise gcmd.error("BUFFER_MOVE: DIST limited to +/-2000 mm")
+        if abs(dist) > JOG_MAX_MM:
+            raise gcmd.error("BUFFER_MOVE: DIST limited to +/-%.0f mm" % JOG_MAX_MM)
+        moved, at_pos3 = self._idle_move(
+            dist, speed, endstop_key="pos3" if dist > 0.0 else None
+        )
+        if at_pos3:
+            gcmd.respond_info(
+                "buffer: stopped at pos3 after %.1f of %.1f mm" % (moved, dist)
+            )
+
+    cmd_BUFFER_LOAD_help = (
+        "Feed filament from the inlet until the slider reaches pos2, which puts"
+        " the tip against the extruder gears: [SPEED=] [MAX=]. A buffer button"
+        " cancels. Not while printing."
+    )
+
+    def cmd_BUFFER_LOAD(self, gcmd):
+        self._require_not_printing(gcmd, "BUFFER_LOAD")
+        if self.synced:
+            raise gcmd.error("BUFFER_LOAD: the buffer is synced; BUFFER_UNSYNC first")
+        if not self.pin_states.get("inlet"):
+            raise gcmd.error("BUFFER_LOAD: no filament at the buffer inlet")
+        if self.pin_states.get("pos2") or self.pin_states.get("pos3"):
+            gcmd.respond_info("buffer: already loaded (the slider is at pos2)")
+            return
+        speed = gcmd.get_float(
+            "SPEED", self.load_speed, above=0.0, maxval=self.max_move_speed
+        )
+        max_mm = gcmd.get_float("MAX", self.load_max_mm, above=0.0, maxval=JOG_MAX_MM)
+        self.loading, self.load_cancel = True, False
+        self.inlet_clear_since = None
+        start = self.reactor.monotonic()
+        try:
+            # slowly first, so the gear catches filament still being pushed in
+            grab = min(self.load_grab_mm, max_mm)
+            moved, hit = self._idle_move(
+                grab, self.load_grab_speed, endstop_key="pos2", abort=self._load_abort
+            )
+            if not hit and not self._load_abort() and max_mm > moved:
+                more, hit = self._idle_move(
+                    max_mm - moved, speed, endstop_key="pos2", abort=self._load_abort
+                )
+                moved += more
+        finally:
+            self.loading = False
+        secs = self.reactor.monotonic() - start
+        if hit:
+            self.last_load_mm = moved
+            gcmd.respond_info(
+                "buffer: loaded, pos2 reached after %.0f mm (%.0f s). The tip is at"
+                " the extruder gears." % (moved, secs)
+            )
+        elif self.load_cancel:
+            gcmd.respond_info("buffer: load cancelled after %.0f mm" % moved)
+        elif not self.pin_states.get("inlet"):
+            raise gcmd.error(
+                "BUFFER_LOAD: stopped after %.0f mm, the filament left the inlet" % moved
+            )
+        else:
+            raise gcmd.error(
+                "BUFFER_LOAD: pos2 not reached after %.0f mm. The buffer gear may not"
+                " have gripped the filament, or the path is longer than"
+                " load_max_mm." % moved
+            )
+
+    # --- calibration -----------------------------------------------------
+    cmd_BUFFER_CALIBRATE_help = (
+        "Measure the buffer's true rotation_distance against the extruder and"
+        " apply it. Needs filament loaded through the extruder and a hot"
+        " hotend (or TEMP=); extrudes about 15 mm per run plus a warm-up run."
+        " [RUNS=3] [SPEED=4]"
+        " [EXTRUDE_SPEED=2] [TEMP=]"
+    )
+
+    def _buffer_mm_at(self, eventtime):
+        pt = self.mcu.estimated_print_time(eventtime)
+        steps = self.mcu_stepper.get_past_mcu_position(pt)
+        return steps * self.mcu_stepper.get_step_dist()
+
+    def _edge_positions(self, log, position_at, label):
+        """Position of the last edge of each (sensor, state) in an edge log."""
+        edges = {}
+        for key, state, et in log:
+            edges[(key, state)] = pos = position_at(et)
+            logging.info("filament_buffer: calibrate %s %s=%d at %.4f -> %.3f mm",
+                         label, key, state, et, pos)
+        return edges
+
+    def _calibration_run(self, gcmd, speed, espeed, max_mm):
+        run = self.gcode.run_script_from_command
+        # Start at the top of the pos1 zone
+        if not self.pin_states.get("pos1"):
+            self._idle_move(-max_mm, speed, abort=lambda: self.pin_states.get("pos1"))
+            self._settle()
+            if not self.pin_states.get("pos1"):
+                raise gcmd.error("BUFFER_CALIBRATE: the slider did not return to pos1")
+        # Up: the buffer feeds while the extruder holds the filament
+        self.edge_log = []
+        moved, hit = self._idle_move(max_mm, speed, endstop_key="pos3")
+        if hit:
+            # a little past the edge, so the slider settling can't clear pos3
+            self._idle_move(1.0, speed)
+        self._settle()
+        up, self.edge_log = self.edge_log, None
+        if not hit:
+            raise gcmd.error(
+                "BUFFER_CALIBRATE: pos3 not reached after %.0f mm of buffer feed. Is"
+                " the filament loaded through the extruder?" % moved
+            )
+        # Down: the extruder pulls while the buffer holds
+        self.edge_log = []
+        done = 0.0
+        while not self.pin_states.get("pos1"):
+            if done >= max_mm:
+                self.edge_log = None
+                raise gcmd.error(
+                    "BUFFER_CALIBRATE: pos1 not reached after extruding %.0f mm" % done
+                )
+            run("G1 E0.5 F%.1f\nM400" % (espeed * 60.0))
+            done += 0.5
+        self._settle()
+        down, self.edge_log = self.edge_log, None
+        try:
+            return calibration_result(
+                self._edge_positions(up, self._buffer_mm_at, "buffer"),
+                self._edge_positions(down, self._extruder_pos, "extruder"),
+            )
+        except (KeyError, ValueError):
+            raise gcmd.error(
+                "BUFFER_CALIBRATE: unexpected sensor sequence (up %s, down %s)"
+                % ([(k, s) for k, s, t in up], [(k, s) for k, s, t in down])
+            )
+
+    def cmd_BUFFER_CALIBRATE(self, gcmd):
+        self._require_not_printing(gcmd, "BUFFER_CALIBRATE")
+        runs = gcmd.get_int("RUNS", 3, minval=1, maxval=10)
+        speed = gcmd.get_float("SPEED", 4.0, above=0.0, maxval=20.0)
+        espeed = gcmd.get_float("EXTRUDE_SPEED", 2.0, above=0.0, maxval=10.0)
+        max_mm = gcmd.get_float("MAX", 60.0, minval=10.0, maxval=200.0)
+        temp = gcmd.get_float("TEMP", None, minval=0.0, maxval=320.0)
+        if not self.pin_states.get("inlet"):
+            raise gcmd.error("BUFFER_CALIBRATE: no filament at the buffer inlet")
+        if temp is not None:
+            self.gcode.run_script_from_command("M109 S%.1f" % temp)
+        if not self.extruder.get_heater().can_extrude:
+            raise gcmd.error(
+                "BUFFER_CALIBRATE: hotend too cold to extrude; heat it or pass TEMP="
+            )
+        run = self.gcode.run_script_from_command
         was_synced = self.synced
         if was_synced:
             self._do_sync(False)
+        results = []
+        # the extruder must hold the filament while the buffer pushes
+        run("SET_STEPPER_ENABLE STEPPER=%s ENABLE=1" % self.extruder_name)
+        run("SAVE_GCODE_STATE NAME=_buffer_cal\nM83")
         try:
-            self.force_move.manual_move(self.mcu_stepper, dist, speed, accel)
-        finally:
+            # The first cycle only conditions the path: after the motor has
+            # been off the slider may sit deep in pos1 with slack in the tube
+            self._calibration_run(gcmd, speed, espeed, max_mm)
+            gcmd.respond_info("buffer calibrate: warm-up cycle done")
+            for i in range(runs):
+                ratio, geo = self._calibration_run(gcmd, speed, espeed, max_mm)
+                results.append((ratio, geo))
+                gcmd.respond_info(
+                    "buffer calibrate %d/%d: %.4f mm per commanded mm, pos1-pos3"
+                    " span %.2f mm" % (i + 1, runs, ratio, geo["span_mm"])
+                )
+        except Exception:
+            self.edge_log = None
+            run("RESTORE_GCODE_STATE NAME=_buffer_cal")
             if was_synced:
                 self._do_sync(True)
+            raise
+        run("RESTORE_GCODE_STATE NAME=_buffer_cal")
+        ratios = sorted(r for r, g in results)
+        median = ratios[len(ratios) // 2]
+        spread = (ratios[-1] - ratios[0]) / median
+        if spread > CALIBRATE_SPREAD:
+            if was_synced:
+                self._do_sync(True)
+            raise gcmd.error(
+                "BUFFER_CALIBRATE: runs disagree by %.1f%% (gear slipping?);"
+                " nothing changed" % (spread * 100.0)
+            )
+        old_rd = self.base_rd
+        self.base_rd = old_rd * median
+        self._reset_rate()
+        if was_synced:
+            self._do_sync(True)
+        geo = results[-1][1]
+        lines = [
+            "rotation_distance %.4f -> %.4f (applied until restart; put"
+            " rotation_distance: %.3f in [extruder_stepper %s])"
+            % (old_rd, self.base_rd, self.base_rd, self.stepper_name),
+            "spread between runs %.2f%%" % (spread * 100.0),
+        ]
+        if "gap_mm" in geo:
+            lines.append(
+                "slider: %.1f mm from leaving pos1 to pos2, %.1f mm from pos2 to"
+                " pos3 (band_mm), pos2 %s pos3"
+                % (geo["gap_mm"], geo["band_mm"],
+                   "overlaps" if geo["overlap"] else "is separate from")
+            )
+        gcmd.respond_info("\n".join("buffer calibrate: " + l for l in lines))
 
     cmd_BUFFER_SET_help = (
         "Change buffer tuning at runtime: [M_POS1=] [M_APPROACH_BELOW=]"
         " [M_BELOW=] [M_TARGET=] [M_ABOVE=] [M_APPROACH_ABOVE=] [M_POS3=]"
-        " [TENSION_FAULT_MM=] [COMPRESSION_FAULT_MM=] [TRIM=] [REPORT_EVENTS=0|1]"
+        " [TENSION_FAULT_MM=] [COMPRESSION_FAULT_MM=] [TRIM=] [BAND_MM=]"
+        " [REPORT_EVENTS=0|1] [ROTATION_DISTANCE=] (not while printing)"
     )
 
     def cmd_BUFFER_SET(self, gcmd):
         c = self.ctrl
+        rd = gcmd.get_float("ROTATION_DISTANCE", None, above=0.0)
+        if rd is not None:
+            self._require_not_printing(gcmd, "BUFFER_SET ROTATION_DISTANCE")
+            self.base_rd = rd
+            if self.synced:
+                self.mcu_stepper.set_rotation_distance(self.base_rd / self.applied_mult)
+            else:
+                self._reset_rate()
+        c.band_mm = gcmd.get_float("BAND_MM", c.band_mm, minval=0.0)
         c.set_multipliers(
             m_pos1=gcmd.get_float("M_POS1", None, above=1.0),
             m_approach_below=gcmd.get_float("M_APPROACH_BELOW", None, above=1.0),
@@ -896,7 +1458,8 @@ class FilamentBuffer:
         " buffer into the extruder, printer homed with the nozzle >= MIN_Z"
         " above the bed (over a cup), hotend hot or TEMP=. Options: LENGTH=300"
         " SEGMENT=10 SPEEDS=1.5,3,5 RETRACT=1.0 RETRACT_SPEED=35 TRAVEL_MS=300"
-        " CHECK_EVERY=25 MIN_Z=20 TEMP= DRY_RUN=1"
+        " CHECK_EVERY=25 MIN_Z=20 TEMP= DRY_RUN=1. CHECK_Z=0 skips the homing"
+        " and height check when you know the nozzle is clear of the bed."
     )
 
     def _test_check(self):
@@ -968,6 +1531,7 @@ class FilamentBuffer:
         travel_ms = gcmd.get_int("TRAVEL_MS", 300, minval=0, maxval=5000)
         check_every = gcmd.get_float("CHECK_EVERY", 25.0, minval=5.0)
         min_z = gcmd.get_float("MIN_Z", 20.0, minval=0.0)
+        check_z = gcmd.get_int("CHECK_Z", 1, minval=0, maxval=1)
         temp = gcmd.get_float("TEMP", None, minval=0.0, maxval=320.0)
         dry_run = gcmd.get_int("DRY_RUN", 0, minval=0, maxval=1)
         try:
@@ -1002,9 +1566,14 @@ class FilamentBuffer:
         eventtime = self.reactor.monotonic()
         if not self.pin_states.get("inlet"):
             raise gcmd.error("BUFFER_TEST_EXTRUDE: no filament at the buffer inlet")
-        if "z" not in self.toolhead.get_status(eventtime)["homed_axes"]:
-            raise gcmd.error("BUFFER_TEST_EXTRUDE: home the printer first (Z must be known)")
-        if self.toolhead.get_position()[2] < min_z:
+        if not check_z:
+            gcmd.respond_info("buffer test: CHECK_Z=0, not checking the nozzle height")
+        elif "z" not in self.toolhead.get_status(eventtime)["homed_axes"]:
+            raise gcmd.error(
+                "BUFFER_TEST_EXTRUDE: home the printer first (Z must be known), or pass"
+                " CHECK_Z=0 if the nozzle is clear of the bed"
+            )
+        elif self.toolhead.get_position()[2] < min_z:
             raise gcmd.error(
                 "BUFFER_TEST_EXTRUDE: raise the nozzle to Z >= %.0f first (over a cup)" % min_z
             )
@@ -1065,6 +1634,8 @@ class FilamentBuffer:
             "fault": c.fault or "",
             "faults_armed": c.faults_enabled,
             "base_rotation_distance": self.base_rd or 0.0,
+            "loading": self.loading,
+            "last_load_mm": self.last_load_mm or 0.0,
         }
         status.update(self.pin_states)
         return status

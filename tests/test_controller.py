@@ -3,7 +3,10 @@
 A physical model of the buffer slider drives the real controller code:
 - x = slider position in filament-mm (0 = pos1 rest end, grows as the spring
   compresses). Feeding more than the extruder consumes raises x.
-- Hall sensors are windows on x with hysteresis.
+- Hall sensors are windows on x with hysteresis. The default geometry is the
+  one measured on a Mellow LLL Buffer Plus: pos1 blocked over the first 19 mm,
+  a 9.6 mm gap, then pos2 blocked from 28.6 mm up past pos3 (33.0 mm), which
+  stays blocked to the end stop.
 - The buffer motor is synced to the commanded extruder motion; rate changes
   take effect after a latency (Kalico step-generation window).
 Run from the repo root:  python -m unittest discover -s tests -v
@@ -39,6 +42,11 @@ class Sensor:
         return changed
 
 
+# (pos1 top, pos2 bottom, pos2 top, pos3 bottom) in filament mm, and end stop
+LLL_PLUS = ((19.0, 28.6, 36.6, 33.0), 40.0)  # measured; pos2 overlaps pos3
+SEPARATE = ((2.0, 13.0, 15.0, 26.0), 30.0)  # three separate sensor windows
+
+
 class BufferSim:
     def __init__(
         self,
@@ -48,8 +56,8 @@ class BufferSim:
         latency=0.25,
         dt=0.005,
         faults=True,
-        x_max=30.0,
-        geometry=(2.0, 13.0, 15.0, 26.0),
+        x_max=LLL_PLUS[1],
+        geometry=LLL_PLUS[0],
         hyst=0.3,
         x_noise=0.0,
         seed=0,
@@ -62,6 +70,9 @@ class BufferSim:
         self.x_noise = x_noise
         self.rnd = random.Random(seed)
         p1, p2a, p2b, p3 = geometry
+        self.p1_top, self.p2_lo, self.p3_lo = p1, p2a, p3
+        # where a settled slider should be: around the lower edge of pos2
+        self.hover_band = (p2a - 2.0, min(p2a + 3.0, p3 - 0.5))
         self.sensors = {
             "pos1": Sensor(-1e9, p1, hyst),
             "pos2": Sensor(p2a, p2b, hyst),
@@ -208,6 +219,12 @@ def new_ctrl(**kw):
     return FeedController(**kw)
 
 
+def separate_sim(ctrl_kw=None, **kw):
+    """Sim and controller for the separate-windows sensor layout."""
+    ctrl = new_ctrl(overlap=False, **(ctrl_kw or {}))
+    return BufferSim(ctrl, geometry=SEPARATE[0], x_max=SEPARATE[1], **kw)
+
+
 class TestZoneLogic(unittest.TestCase):
     def test_debounce_ignores_flicker_and_keeps_edge_position(self):
         c = new_ctrl()  # debounce 0.3 mm of extruder travel
@@ -216,16 +233,16 @@ class TestZoneLogic(unittest.TestCase):
         c.on_sensor("pos2", True, +1, 10.0)
         c.on_sensor("pos2", False, +1, 10.05)  # flicker: never counts
         c.on_progress(11.0)
-        self.assertEqual(c.zone, "unknown")
+        self.assertEqual(c.zone, "below")  # nothing blocked: the pos1-pos2 gap
         c.on_sensor("pos2", True, +1, 12.0)
         c.on_progress(12.1)  # only 0.1 mm since the edge: not yet
-        self.assertEqual(c.zone, "unknown")
+        self.assertEqual(c.zone, "below")
         c.on_progress(12.5)
         self.assertEqual(c.zone, ZONE_POS2)
         self.assertEqual(c.zone_entry_e, 12.0)  # timed from the real edge
 
     def test_pos2_exit_side_inferred_from_multiplier(self):
-        c = new_ctrl(debounce_mm=0.0)
+        c = new_ctrl(debounce_mm=0.0, overlap=False)
         c.set_raw_state("pos2", True)
         c.reset_zone(0.0)
         self.assertEqual(c.zone, ZONE_POS2)
@@ -236,6 +253,59 @@ class TestZoneLogic(unittest.TestCase):
         # while retracting the relative motion flips
         c.on_sensor("pos2", False, -1, 21.0)
         self.assertEqual(c.zone, "above")
+
+    def test_overlap_pos2_exit_is_always_below(self):
+        c = new_ctrl(debounce_mm=0.0)
+        c.set_raw_state("pos2", True)
+        c.reset_zone(0.0)
+        c.drift_up = True  # a belief that would say "above" without overlap
+        c.on_sensor("pos2", False, -1, 10.0)
+        self.assertEqual(c.zone, "below")
+        self.assertFalse(c.approach)
+
+    def test_overlap_descent_from_pos3_relieves_until_pos2_edge(self):
+        c = new_ctrl(debounce_mm=0.0)
+        c.set_raw_state("pos2", True)
+        c.set_raw_state("pos3", True)
+        c.reset_zone(0.0)
+        self.assertEqual(c.zone, ZONE_POS3)
+        c.on_sensor("pos3", False, +1, 5.0)
+        self.assertEqual((c.zone, c.approach), (ZONE_POS2, True))
+        self.assertEqual(c.multiplier(), c.m_approach_above)
+        c.on_sensor("pos2", False, +1, 30.0)
+        self.assertEqual((c.zone, c.approach), ("below", False))
+        self.assertEqual(c.multiplier(), c.m_below)
+        self.assertIsNone(c.cycle_pos2_mm, "a descent from pos3 is not a hover cycle")
+
+    def test_pos2_rising_with_pos3_blocked_stays_pos3(self):
+        # top of travel: the magnet has passed pos2 and comes back over it
+        c = new_ctrl(debounce_mm=0.0)
+        c.set_raw_state("pos3", True)
+        c.reset_zone(0.0)
+        c.on_sensor("pos2", True, +1, 1.0)
+        self.assertEqual(c.zone, ZONE_POS3)
+
+    def test_rise_through_pos2_band_sets_trim_in_one_step(self):
+        c = new_ctrl(debounce_mm=0.0)
+        c.reset_zone(0.0)  # nothing blocked: below pos2
+        c.on_sensor("pos2", True, +1, 10.0)  # enters at the lower edge
+        # +4% feed error: at m_target the slider rises 0.99 * 1.04 - 1 of the
+        # extrusion, so it needs this much to cross the 4.4 mm band
+        c.on_sensor("pos3", True, +1, 10.0 + c.band_mm / (0.99 * 1.04 - 1.0))
+        self.assertAlmostEqual(c.trim * 1.04, 1.0, places=3)
+
+    def test_fast_rise_is_a_disturbance_not_a_ratio_error(self):
+        c = new_ctrl(debounce_mm=0.0)
+        c.reset_zone(0.0)
+        c.on_sensor("pos2", True, +1, 10.0)
+        c.on_sensor("pos3", True, +1, 20.0)  # 4.4 mm in 10 mm: far too fast
+        self.assertAlmostEqual(c.trim, 1.0 - c.trim_nudge)
+
+    def test_overlap_nothing_blocked_at_sync_is_below_pos2(self):
+        c = new_ctrl()
+        c.reset_zone(0.0)
+        self.assertEqual((c.zone, c.approach), ("below", True))
+        self.assertEqual(new_ctrl(overlap=False).zone, "unknown")
 
     def test_impossible_state_faults_when_armed(self):
         c = new_ctrl(debounce_mm=0.0)
@@ -255,7 +325,8 @@ class TestSimulatedPrints(unittest.TestCase):
     def assert_hovers_at_pos2(self, sim, settle_mm=400.0):
         late = [x for e, x in sim.samples if e > settle_mm]
         self.assertTrue(late, "no samples after settling")
-        near = sum(1 for x in late if 11.0 <= x <= 16.0) / len(late)
+        lo, hi = sim.hover_band
+        near = sum(1 for x in late if lo <= x <= hi) / len(late)
         self.assertGreater(near, 0.95, "slider near pos2 only %.0f%% of the time" % (near * 100))
 
     def test_nominal_print_holds_pos2_no_faults(self):
@@ -264,7 +335,7 @@ class TestSimulatedPrints(unittest.TestCase):
             run_print(sim, 3000.0, seed)
             self.assertIsNone(sim.fault, "seed %d: %s" % (seed, sim.fault))
             self.assert_hovers_at_pos2(sim)
-            self.assertLess(sim.max_x, 26.0, "seed %d reached pos3" % seed)
+            self.assertLess(sim.max_x, sim.p3_lo, "seed %d reached pos3" % seed)
             per_100mm = sim.rate_changes / (sim.E / 100.0)
             self.assertLess(per_100mm, 6.0, "too many rate changes: %.1f/100mm" % per_100mm)
 
@@ -284,7 +355,10 @@ class TestSimulatedPrints(unittest.TestCase):
                 "err %+.2f: remaining error %+.4f outside the stable band" % (err, remaining),
             )
             self.assert_hovers_at_pos2(sim, settle_mm=2500.0)
-            late_hits = [e for e, x in sim.samples if e > 2500.0 and (x < 2.3 or x > 25.7)]
+            late_hits = [
+                e for e, x in sim.samples
+                if e > 2500.0 and (x < sim.p1_top + 0.3 or x > sim.p3_lo - 0.3)
+            ]
             self.assertFalse(late_hits, "err %+.2f: slider reached pos1/pos3 after settling" % err)
 
     def test_high_flow_no_false_faults(self):
@@ -302,8 +376,9 @@ class TestSimulatedPrints(unittest.TestCase):
         run_print(sim, 3000.0, seed=4)
         self.assertIsNotNone(sim.fault)
         self.assertIn("tension", sim.fault)
-        # from slip: drain the slack (< ~16 mm) + latency + tension_fault_mm
-        self.assertLess(sim.fault_E - e_slip, 16.0 + c.tension_fault_mm + 5.0)
+        # from slip: drain the slack down to pos1 + latency + tension_fault_mm
+        slack = sim.hover_band[1] - sim.p1_top
+        self.assertLess(sim.fault_E - e_slip, slack + c.tension_fault_mm + 5.0)
 
     def test_clog_pauses_and_limits_grinding(self):
         c = new_ctrl()
@@ -315,7 +390,8 @@ class TestSimulatedPrints(unittest.TestCase):
         run_print(sim, 3000.0, seed=6)
         self.assertIsNotNone(sim.fault)
         self.assertIn("compression", sim.fault)
-        self.assertLess(sim.fault_E - e_clog, 14.0 + c.compression_fault_mm + 5.0)
+        rise = sim.p3_lo - sim.hover_band[0]
+        self.assertLess(sim.fault_E - e_clog, rise + c.compression_fault_mm + 5.0)
         # filament pushed into the jammed path beyond the slider's end stop
         self.assertLess(sim.ground_mm, 12.0, "pushed %.1f mm against the stop" % sim.ground_mm)
 
@@ -328,7 +404,8 @@ class TestSimulatedPrints(unittest.TestCase):
         self.assertIsNone(sim.fault, sim.fault)
         self.assertAlmostEqual(sim.ctrl.trim * 1.03, 1.0, delta=0.012)
         late = [x for e, x in sim.samples if e > 6500.0]
-        self.assertGreater(sum(1 for x in late if 11.0 <= x <= 16.0) / len(late), 0.95)
+        lo, hi = sim.hover_band
+        self.assertGreater(sum(1 for x in late if lo <= x <= hi) / len(late), 0.95)
 
     def test_sensor_noise_near_edges(self):
         sim = BufferSim(new_ctrl(), ratio_err=0.01, x0=0.0, x_noise=0.08, seed=5)
@@ -345,14 +422,30 @@ class TestSimulatedPrints(unittest.TestCase):
 
     def test_other_sensor_geometries(self):
         # (pos1 top, pos2 bottom, pos2 top, pos3 bottom) in filament mm
-        for geo in ((1.0, 8.0, 9.5, 16.0), (3.0, 18.0, 22.0, 34.0), (2.0, 10.0, 10.8, 20.0)):
+        cases = [
+            (False, (1.0, 8.0, 9.5, 16.0), 20.0),
+            (False, (3.0, 18.0, 22.0, 34.0), 38.0),
+            (False, (2.0, 10.0, 10.8, 20.0), 24.0),
+            (True, (8.0, 16.0, 26.0, 20.0), 30.0),
+            (True, (25.0, 34.0, 46.0, 41.0), 48.0),
+        ]
+        for overlap, geo, x_max in cases:
             for err in (-0.03, 0.03):
-                sim = BufferSim(new_ctrl(), ratio_err=err, x0=0.0, geometry=geo, x_max=geo[3] + 4.0)
+                sim = BufferSim(new_ctrl(overlap=overlap), ratio_err=err, x0=0.0,
+                                geometry=geo, x_max=x_max)
                 run_print(sim, 4000.0, seed=15)
                 self.assertIsNone(sim.fault, "geo %s err %+.2f: %s" % (geo, err, sim.fault))
                 late = [x for e, x in sim.samples if e > 2000.0]
-                band = sum(1 for x in late if geo[1] - 2.0 <= x <= geo[2] + 1.0) / len(late)
+                lo, hi = sim.hover_band
+                band = sum(1 for x in late if lo <= x <= hi) / len(late)
                 self.assertGreater(band, 0.95, "geo %s err %+.2f: %.0f%%" % (geo, err, band * 100))
+
+    def test_separate_sensor_layout_still_holds_pos2(self):
+        for err in (-0.03, 0.0, 0.03):
+            sim = separate_sim(ratio_err=err, x0=0.0)
+            run_print(sim, 5000.0, seed=9)
+            self.assertIsNone(sim.fault, "err %+.2f: %s" % (err, sim.fault))
+            self.assert_hovers_at_pos2(sim, settle_mm=2500.0)
 
     def test_soak_many_prints_no_false_faults(self):
         for seed in range(20, 30):
@@ -429,7 +522,7 @@ class TestSimulatedPrints(unittest.TestCase):
     def test_starting_at_rest_reaches_pos2_quickly(self):
         sim = BufferSim(new_ctrl(), x0=0.0)
         run_print(sim, 400.0, seed=8)
-        first_pos2 = next((e for e, x in sim.samples if 13.0 <= x <= 15.0), None)
+        first_pos2 = next((e for e, x in sim.samples if x >= sim.p2_lo), None)
         self.assertIsNotNone(first_pos2)
         self.assertLess(first_pos2, 120.0, "took %.0f mm to reach pos2" % first_pos2)
 
