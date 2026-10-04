@@ -26,6 +26,38 @@ running on a Voron 2.4. Unload, a runout deadline and same-spool continuation ar
 
 ## How it works
 
+```mermaid
+flowchart TD
+    subgraph PATH["Filament path"]
+        direction LR
+        SPOOL["Spool"] --> INLET["Inlet switch"] --> GEAR["Buffer gear"] --> SLIDER["Slider, stores slack"] --> TUBE["PTFE tube"] --> EXT["Extruder gears"] --> NOZ["Nozzle"]
+    end
+    subgraph BOARD["Buffer board: STM32F072 running Kalico"]
+        HALL["Hall sensors pos1, pos2, pos3"]
+        DRV["TMC2208 driver and motor"]
+    end
+    subgraph PI["Raspberry Pi: Kalico host"]
+        PLAN["Motion planner, runs the G-code"]
+        ZONE["filament_buffer: sensor edge to zone"]
+        RATE["Zone to multiplier m"]
+        FAULT{"Stuck at pos1 or pos3, or runout?"}
+    end
+    SLIDER -. "magnet on the slider" .-> HALL
+    HALL -- "sensor edges over USB" --> ZONE
+    ZONE --> RATE
+    RATE -- "rotation distance = base / (trim × m), no toolhead flush" --> DRV
+    PLAN -- "extruder moves, via the mainboard and toolhead board" --> EXT
+    PLAN -- "the same moves, synced" --> DRV
+    DRV --> GEAR
+    ZONE --> FAULT
+    FAULT -- "yes, while printing" --> PAUSE["PAUSE the print"]
+```
+
+In practice: the extruder pulls filament and the buffer pushes it, both driven by the same
+G-code moves. Any mismatch goes into the slider. When the slider crosses a sensor, the buffer
+board reports the edge, the plugin picks a slightly faster or slower feed, and only the buffer
+motor's step size changes, so the print never pauses for it. Only a real fault does that.
+
 The buffer motor is an `[extruder_stepper]` synced to the extruder. Hall sensors along the slider's
 travel give the zone, and the plugin feeds slightly more or less than the extruder:
 
@@ -50,24 +82,24 @@ filament's own tolerance. Retractions (up to 1 mm and more) are followed exactly
 
 The slider stores slack, so its position $x$ follows the difference between what the buffer
 delivers and what the extruder takes. With $E$ the extruder position, $m$ the zone multiplier,
-$	au$ the learned trim and $r$ the buffer's remaining feed error:
+$\tau$ the learned trim and $r$ the buffer's remaining feed error:
 
 ```math
-rac{dx}{dE} = g\,m(z) - 1, \qquad g = (1+r)\,	au
+\frac{dx}{dE} = g\,m(z) - 1, \qquad g = (1+r)\,\tau
 ```
 
 Everything is per mm of extrusion rather than per second, so pauses and slow moves don't matter.
-Around the lower edge of pos2 the multiplier switches between $1-arepsilon$ (inside) and
+Around the lower edge of pos2 the multiplier switches between $1-\varepsilon$ (inside) and
 $1+\delta$ (below), which holds the slider at the edge whenever
 
 ```math
-rac{1}{1+\delta} < g < rac{1}{1-arepsilon}, \qquad \delta = 0.02,\ arepsilon = 0.01
+\frac{1}{1+\delta} < g < \frac{1}{1-\varepsilon}, \qquad \delta = 0.02,\ \varepsilon = 0.01
 ```
 
 The trim is learned so $g$ stays in that band. From a hover cycle, using the share $f_2$ of
-extrusion spent inside pos2, the remaining error is $\hat e = f_2(\delta+arepsilon) - \delta$. From
+extrusion spent inside pos2, the remaining error is $\hat e = f_2(\delta+\varepsilon) - \delta$. From
 a rise through the pos2 band of width $w$ over $\Delta E$ of extrusion, it is set in one step to
-$	au' = 	au\\,(1-arepsilon)/(1 + w/\Delta E)$. Calibration measures the buffer's true feed per
+$\tau' = \tau\\,(1-\varepsilon)/(1 + w/\Delta E)$. Calibration measures the buffer's true feed per
 commanded mm as $k = S_e / S_b$, the extruder span over the buffer span between the same sensor
 edges.
 
@@ -87,6 +119,25 @@ The derivations, assumptions and where every default comes from are in
   measures the buffer's true `rotation_distance` against the extruder (a warm-up cycle and three
   runs, about 15 mm extruded each) and applies it until the next restart. It prints the value to put in the config,
   along with the slider's sensor geometry.
+
+```mermaid
+flowchart TD
+    A["Filament loaded through the extruder, hotend hot"] --> B["Warm-up cycle: takes up slack left in the tube"]
+    B --> C["Up: the buffer feeds while the extruder holds.<br/>Buffer distance from pos1 clearing to pos3 tripping = Sb"]
+    C --> D["Down: the extruder pulls while the buffer holds.<br/>Extruder distance from pos3 clearing to pos1 tripping = Se"]
+    D --> E{"Three runs agree within 4 percent?"}
+    E -- "no" --> F["Nothing changes.<br/>Check the buffer gear for slip"]
+    E -- "yes" --> G["k = Se / Sb, the median of the runs"]
+    G --> H["rotation_distance × k: applied now,<br/>printed for the config"]
+```
+
+**Why it matters.** The slider covers the same distance in both directions, so $k$ is how much
+filament the buffer really moves per mm it is told to move, measured against the extruder.
+Everything else depends on it. Holding the slider at pos2 needs the buffer within about
+$-2\\%$ to $+1\\%$ of the extruder, and the auto-trim can only make up $\pm 5\\%$. On the first
+install the rotation distance came from the stock firmware and $k$ was 0.45: the 1.5× catch-up
+rate was really 0.68×, the slider sat at pos1 and the extrusion test aborted. After calibration
+$k$ is 1.00 to 1.03 and the same test passes.
 
 ## Requirements
 

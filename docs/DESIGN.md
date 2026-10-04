@@ -103,10 +103,10 @@ The buffer follows the extruder's motion, retractions included, at
 `base_rotation_distance / (trim × m)`. The slider then moves as
 
 ```math
-rac{dx}{dE} = g\,m - 1, \qquad g = (1 + r)\,	au
+\frac{dx}{dE} = g\,m - 1, \qquad g = (1 + r)\,\tau
 ```
 
-per mm of extrusion, where $r$ is the buffer's remaining feed error and $	au$ the trim
+per mm of extrusion, where $r$ is the buffer's remaining feed error and $\tau$ the trim
 ([CONTROL.md, section 2](CONTROL.md#2-plant-model)):
 
 | Slider zone | `m` |
