@@ -149,7 +149,7 @@ flowchart LR
     A["Wrong ratio<br/>k = 0.45"] --> B["1.5x catch-up is<br/>really 0.68x"] --> C["Slider stuck<br/>at pos1"] --> D["Test aborts"]
 ```
 
-For example, a `rotation_distance` derived from the stock firmware's settings gives $k pprox 0.45$
+For example, a `rotation_distance` derived from the stock firmware's settings gives $k \approx 0.45$
 on the LLL Plus, and `BUFFER_TEST_EXTRUDE` aborts at pos1. A calibrated buffer measures within a
 few percent of $k = 1$.
 
