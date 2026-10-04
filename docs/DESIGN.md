@@ -95,7 +95,8 @@ stand-in Kalico objects: during a simulated print the plugin makes no motion-que
 
 The plugin lives in `klippy/plugins/` (symlinked by `install.sh`), which Kalico loads like a built-in
 module and its git tree ignores. `BUFFER_SYNC` belongs in `PRINT_START` after homing and leveling,
-where the queue is already empty; `BUFFER_UNSYNC` after an `M400` in `PRINT_END`.
+where the queue is already empty; `BUFFER_UNSYNC` after an `M400` in `PRINT_END`. While a print is
+running both are refused unless the motion queue is empty, so neither can add a stop.
 
 ## Feed control
 
@@ -216,7 +217,7 @@ printed for the config, with the gap and band widths.
 | Layer | What it proves |
 |---|---|
 | `tests/test_controller.py` (26 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs |
-| `tests/test_adapter.py` (22 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; calibration math; config defaults equal the simulated values |
+| `tests/test_adapter.py` (23 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; calibration math; config defaults equal the simulated values |
 | `config/buffer-test.cfg` | Hardware: sensors, TMC link, LEDs, sync, motor direction |
 | `BUFFER_TEST_EXTRUDE` | Synced extrusion into the air at several speeds with 1 mm retractions. Checks the buffer every 25 mm and aborts safely when filament isn't consumed, isn't fed, or runs out |
 | Planned | A full test print with the buffer active: `print_stall` stays 0 and print time matches a run without it |

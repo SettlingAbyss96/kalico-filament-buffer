@@ -470,6 +470,17 @@ class TestHardRule(unittest.TestCase):
         cmds["BUFFER_SYNC"](FakeGcmd())
         self.assertEqual(self.toolhead.calls, [])
 
+    def test_unsync_at_print_end_needs_the_toolhead_stopped(self):
+        cmds = self.printer.objects["gcode"].commands
+        cmds["BUFFER_SYNC"](FakeGcmd())
+        self.printer.objects["print_stats"].state = "printing"
+        self.toolhead.lookahead.last = object()
+        with self.assertRaises(CommandError):
+            cmds["BUFFER_UNSYNC"](FakeGcmd())
+        self.toolhead.lookahead.last = None  # after M400 in PRINT_END
+        cmds["BUFFER_UNSYNC"](FakeGcmd())
+        self.assertFalse(self.buf.synced)
+
     def test_buttons_ignored_while_printing(self):
         self.printer.objects["print_stats"].state = "printing"
         self.press("!buffer:PB12", 1)

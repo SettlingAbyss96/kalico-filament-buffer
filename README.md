@@ -190,15 +190,15 @@ managed_services: klipper
 |---|---|
 | `BUFFER_STATUS` | zone, multiplier, trim, sensors, rotation distance, fault |
 | `BUFFER_STATS [RESET=1]` | extrusion share per zone, zone entries, rate changes, trim learning since reset |
-| `BUFFER_SYNC` / `BUFFER_UNSYNC` | sync the buffer to the extruder / release it. SYNC needs the toolhead stopped (call it after G28/QGL or M400 in PRINT_START); UNSYNC isn't allowed while printing |
+| `BUFFER_SYNC` / `BUFFER_UNSYNC` | sync the buffer to the extruder / release it. during a print both need the toolhead stopped: SYNC after an M400 in PRINT_START, UNSYNC after an M400 in PRINT_END |
 | `BUFFER_LOAD [SPEED=] [MAX=]` | feed from the inlet until the slider reaches pos2 (also runs by itself when filament is inserted) |
 | `BUFFER_CALIBRATE [RUNS=3] [TEMP=]` | measure and apply the buffer's true `rotation_distance` |
 | `BUFFER_MOVE DIST= [SPEED=]` | move the buffer on its own; feeding stops early at pos3 |
 | `BUFFER_SET ...` | runtime tuning (multipliers, fault distances, trim, `BAND_MM`, `REPORT_EVENTS=0/1`, `ROTATION_DISTANCE`) |
 | `BUFFER_TEST_EXTRUDE [TEMP=] [LENGTH=300] [SPEEDS=1.5,3,5] [RETRACT=1.0] [DRY_RUN=1] [CHECK_Z=0] ...` | automated synced-extrusion test: syncs, extrudes in segments with retractions, checks the buffer every 25 mm (aborts safely on anomalies), reports PASS/CHECK with statistics. `CHECK_Z=0` skips the homing check when you know the nozzle is clear of the bed |
 
-While printing, only `BUFFER_STATUS`, `BUFFER_STATS`, `BUFFER_SET` tuning and `BUFFER_SYNC` (with
-the toolhead stopped, in `PRINT_START`) are accepted.
+While printing, only `BUFFER_STATUS`, `BUFFER_STATS`, `BUFFER_SET` tuning, and `BUFFER_SYNC` /
+`BUFFER_UNSYNC` with the toolhead stopped (in `PRINT_START` and `PRINT_END`) are accepted.
 
 `printer.filament_buffer` status: `synced`, `zone`, `multiplier`, `trim`, `applied_multiplier`,
 `fault`, `faults_armed`, `base_rotation_distance`, `loading`, `last_load_mm`, and each input
@@ -233,7 +233,7 @@ can't drift from them.
 
 ## Testing
 
-- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 48 tests:
+- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 49 tests:
   - A physical model of the slider, with the sensor geometry measured on a real LLL Plus, drives
     the real controller: retractions up to 1 mm, flow up to 15 mm/s, ratio errors ±4%, sensor
     noise, slow rate application, other sensor geometries and layouts, mid-print filament changes,

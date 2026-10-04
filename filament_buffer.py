@@ -1139,13 +1139,19 @@ class FilamentBuffer:
             % (self.extruder_name, self.ctrl.zone, self.applied_mult)
         )
 
-    cmd_BUFFER_UNSYNC_help = "Unsync the buffer motor from the extruder (not while printing)"
+    cmd_BUFFER_UNSYNC_help = (
+        "Unsync the buffer motor from the extruder (while printing only with the"
+        " toolhead stopped, e.g. after M400 in PRINT_END)"
+    )
 
     def cmd_BUFFER_UNSYNC(self, gcmd):
         if not self.synced:
             gcmd.respond_info("buffer: already unsynced")
             return
-        self._require_not_printing(gcmd, "BUFFER_UNSYNC")
+        if self._is_printing():
+            # PRINT_END still counts as printing; after an M400 the queue is
+            # empty and unsyncing can't add a stop
+            self._require_empty_queue(gcmd, "BUFFER_UNSYNC")
         self._do_sync(False)
         gcmd.respond_info("buffer: unsynced")
 
