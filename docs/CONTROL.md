@@ -16,7 +16,7 @@ Measured values are from a Mellow LLL Buffer Plus on a Voron 2.4 (2026-10-04).
 | $m$ | zone multiplier chosen by the controller (table in section 3) |
 | $\tau$ | trim, learned, bounded to $1 \pm 0.05$ |
 | $r$ | remaining feed error of the buffer: filament grip, wear, a slightly wrong `rotation_distance` |
-| $g = (1+r)\,\tau$ | effective gain: how much the buffer really feeds per mm the extruder takes, before $m$ |
+| $g = (1+r)\\,\tau$ | effective gain: how much the buffer really feeds per mm the extruder takes, before $m$ |
 | $e = g - 1$ | remaining ratio error after trimming |
 | $\delta,\ \varepsilon$ | hover offsets: $m_{below} = 1+\delta$, $m_{target} = 1-\varepsilon$, with $\delta = 0.02$, $\varepsilon = 0.01$ |
 | $x_1, x_2, x_3$ | sensor edges: top of the pos1 zone, lower edge of pos2, lower edge of pos3 |
@@ -79,7 +79,7 @@ m_3 = 0.30 & \text{pos3}
 With three separate sensor windows (`sensor_layout: separate`) there is also a zone above pos2,
 with $m_a = 0.98$ hovering and $m_{aa} = 0.85$ approaching. Which side the slider left pos2 on
 is then inferred from the sign of $dx/dE$ inside pos2, which is negative while extruding when
-$g\,m_t < 1$.
+$g\\,m_t < 1$.
 
 ## 4. Hovering at the lower edge of pos2
 
@@ -92,7 +92,7 @@ g\,(1-\varepsilon) < 1 < g\,(1+\delta)
 \frac{1}{1+\delta} < g < \frac{1}{1-\varepsilon}
 ```
 
-which to first order is $-\delta < e < \varepsilon$, or $-2\% < e < +1\%$. Inside that band the slider
+which to first order is $-\delta < e < \varepsilon$, or $-2\\% < e < +1\\%$. Inside that band the slider
 chatters around $x_2$ with an amplitude set by the debounce and the latency:
 
 ```math
@@ -103,18 +103,18 @@ where $d = 0.3$ mm is the debounce (section 7) and $v_E$ the extrusion speed. Wi
 $|dx/dE| \le 0.02$ that is a few hundredths of a millimeter. Because the push of the spring
 depends on $x$ only, holding $x$ at $x_2$ holds the assisting force constant.
 
-Errors near $+\varepsilon$ are the best case: $g\,m_t$ is close to 1, the slider barely moves and
+Errors near $+\varepsilon$ are the best case: $g\\,m_t$ is close to 1, the slider barely moves and
 almost no rate changes are sent.
 
 ## 5. Learning the trim
 
 The trim only moves inside $[1 - 0.05,\ 1 + 0.05]$, and every update has the form
-$\tau \leftarrow \tau\,(1 + \Delta)$ with that clamp.
+$\tau \leftarrow \tau\\,(1 + \Delta)$ with that clamp.
 
 ### Hover cycles
 
 A clean cycle is pos2, out to below, back to pos2, all at the hover rates. Let $E_2$ and $E_b$ be
-the extrusion spent in pos2 and below. The slider falls $b\,E_2$ and rises $a\,E_b$, and both are
+the extrusion spent in pos2 and below. The slider falls $b\\,E_2$ and rises $a\\,E_b$, and both are
 the same excursion, so
 
 ```math
@@ -129,7 +129,7 @@ f_2 = \frac{E_2}{E_2 + E_b} = \frac{a}{a+b} \approx \frac{e + \delta}{\delta + \
 \hat e = f_2\,(\delta + \varepsilon) - \delta
 ```
 
-The update is $\Delta = -k\,\hat e$ with gain $k = 0.5$ (`trim_gain`). A gain below 1 averages out
+The update is $\Delta = -k\\,\hat e$ with gain $k = 0.5$ (`trim_gain`). A gain below 1 averages out
 noise in $f_2$ from debounce, latency and retractions.
 
 ### Rising through the pos2 band
@@ -156,7 +156,7 @@ correct, so it is treated as a disturbance and gets the fixed nudge instead.
 ### Nudges
 
 Reaching pos1 from "below, hovering", reaching pos3 from pos2, and hover legs longer than
-`hover_stall_mm` (60 mm) each move the trim by $\pm 1\%$ (`trim_nudge`) in the direction that
+`hover_stall_mm` (60 mm) each move the trim by $\pm 1\\%$ (`trim_nudge`) in the direction that
 would have prevented it. With separate sensors, a nudge based on a wrong exit-side guess is
 reverted when a hard sensor proves the guess wrong.
 
@@ -168,8 +168,8 @@ The same plant equation gives the slider's motion during a retraction of length 
 \Delta x = (g\,m - 1)\,(-\ell)
 ```
 
-While hovering, $|g\,m - 1| \le$ a few percent, so a 1 mm retraction moves the slider
-less than 0.05 mm (the simulation checks this over thousands of retractions with errors of $\pm 4\%$).
+While hovering, $|g\\,m - 1| \le$ a few percent, so a 1 mm retraction moves the slider
+less than 0.05 mm (the simulation checks this over thousands of retractions with errors of $\pm 4\\%$).
 The buffer would pull against the extruder only if $x$ had to go below $0$, which needs the slider
 at the rest end with the spring fully relaxed. A print that starts there with a retraction gives
 one bounded tug:
@@ -199,7 +199,7 @@ Rate changes are sent only when $m$ changes, at most once every 0.2 s. They use
 Every fault is a distance of extrusion spent in a zone, $E - E_{entry}$.
 
 **F2, tension** (tangle, slipping gear): still at pos1 after $D_2 = 60$ mm. From the rest end a
-working buffer climbs out of the pos1 zone (depth $x_1 \approx 19$ mm) at $g\,m_1 - 1 \approx 0.5$, so it
+working buffer climbs out of the pos1 zone (depth $x_1 \approx 19$ mm) at $g\\,m_1 - 1 \approx 0.5$, so it
 needs
 
 ```math
@@ -207,9 +207,9 @@ needs
 ```
 
 **F3, compression** (clog, extruder slipping): still at pos3 after $D_3 = 25$ mm. From the end
-stop, about $s \approx 7$ mm above $x_3$, a working buffer falls at $1 - g\,m_3 \approx 0.7$, so it
+stop, about $s \approx 7$ mm above $x_3$, a working buffer falls at $1 - g\\,m_3 \approx 0.7$, so it
 leaves pos3 within $s/0.7 \approx 10$ mm. In a real jam nothing is consumed, so
-$dx/dE = g\,m_3$, and by the time F3 pauses the buffer has pushed at most
+$dx/dE = g\\,m_3$, and by the time F3 pauses the buffer has pushed at most
 
 ```math
 g\,m_3\,D_3 \approx 0.3 \times 25 = 7.5\ \text{mm}
@@ -230,7 +230,7 @@ at $u_1 + h_1$ when the slider rises and blocks at $u_1$ when it falls; pos3 blo
 rising and clears at $u_3 - h_3$ when falling.
 
 - **Up:** the buffer feeds with the extruder holding. From pos1 clearing to pos3 blocking it
-  commands $S_b$ and moves the slider by $u_3 - u_1 - h_1 = k\,S_b$.
+  commands $S_b$ and moves the slider by $u_3 - u_1 - h_1 = k\\,S_b$.
 - **Down:** the extruder takes $S_e$ with the buffer holding. From pos3 clearing to pos1 blocking
   the slider moves by $u_3 - h_3 - u_1 = S_e$.
 
@@ -261,7 +261,7 @@ median is used.
 | After, with 6.300 | about 13.6 mm | about 13.8 mm | 1.009, 1.035, 1.004 |
 
 So the true value is $13.974 \times 0.451 = 6.30$ mm per motor turn, and what is left is within
-the trim's $\pm 5\%$.
+the trim's $\pm 5\\%$.
 
 ## 10. Stopping independent moves
 

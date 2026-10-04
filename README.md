@@ -67,7 +67,7 @@ $1+\delta$ (below), which holds the slider at the edge whenever
 The trim is learned so $g$ stays in that band. From a hover cycle, using the share $f_2$ of
 extrusion spent inside pos2, the remaining error is $\hat e = f_2(\delta+arepsilon) - \delta$. From
 a rise through the pos2 band of width $w$ over $\Delta E$ of extrusion, it is set in one step to
-$	au' = 	au\,(1-arepsilon)/(1 + w/\Delta E)$. Calibration measures the buffer's true feed per
+$	au' = 	au\\,(1-arepsilon)/(1 + w/\Delta E)$. Calibration measures the buffer's true feed per
 commanded mm as $k = S_e / S_b$, the extruder span over the buffer span between the same sensor
 edges.
 
