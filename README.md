@@ -46,6 +46,34 @@ filament's own tolerance. Retractions (up to 1 mm and more) are followed exactly
 1 mm retraction moves the slider less than 0.05 mm. Full design and reasoning:
 [docs/DESIGN.md](docs/DESIGN.md).
 
+### The control law in brief
+
+The slider stores slack, so its position $x$ follows the difference between what the buffer
+delivers and what the extruder takes. With $E$ the extruder position, $m$ the zone multiplier,
+$	au$ the learned trim and $r$ the buffer's remaining feed error:
+
+```math
+rac{dx}{dE} = g\,m(z) - 1, \qquad g = (1+r)\,	au
+```
+
+Everything is per mm of extrusion rather than per second, so pauses and slow moves don't matter.
+Around the lower edge of pos2 the multiplier switches between $1-arepsilon$ (inside) and
+$1+\delta$ (below), which holds the slider at the edge whenever
+
+```math
+rac{1}{1+\delta} < g < rac{1}{1-arepsilon}, \qquad \delta = 0.02,\ arepsilon = 0.01
+```
+
+The trim is learned so $g$ stays in that band. From a hover cycle, using the share $f_2$ of
+extrusion spent inside pos2, the remaining error is $\hat e = f_2(\delta+arepsilon) - \delta$. From
+a rise through the pos2 band of width $w$ over $\Delta E$ of extrusion, it is set in one step to
+$	au' = 	au\,(1-arepsilon)/(1 + w/\Delta E)$. Calibration measures the buffer's true feed per
+commanded mm as $k = S_e / S_b$, the extruder span over the buffer span between the same sensor
+edges.
+
+The derivations, assumptions and where every default comes from are in
+[docs/CONTROL.md](docs/CONTROL.md).
+
 ## Loading and calibration
 
 - **Loading:** insert filament at the buffer inlet. After a second the buffer feeds it, slowly for

@@ -3,7 +3,9 @@
 kalico-filament-buffer turns a three-position filament buffer into a feeder that Kalico drives in
 step with the extruder. This document covers the constraints, the control law, fault handling,
 loading and calibration, testing, and what is still planned. Hardware specifics for the Mellow Fly
-LLL Buffer Plus are in [mellow-buffer-plus.md](mellow-buffer-plus.md).
+LLL Buffer Plus are in [mellow-buffer-plus.md](mellow-buffer-plus.md). The equations behind the
+control law, the learning, the fault distances and calibration, with their assumptions, are in
+[CONTROL.md](CONTROL.md).
 
 ## Goals
 
@@ -98,7 +100,14 @@ where the queue is already empty; `BUFFER_UNSYNC` after an `M400` in `PRINT_END`
 ## Feed control
 
 The buffer follows the extruder's motion, retractions included, at
-`base_rotation_distance / (trim × m)`:
+`base_rotation_distance / (trim × m)`. The slider then moves as
+
+```math
+rac{dx}{dE} = g\,m - 1, \qquad g = (1 + r)\,	au
+```
+
+per mm of extrusion, where $r$ is the buffer's remaining feed error and $	au$ the trim
+([CONTROL.md, section 2](CONTROL.md#2-plant-model)):
 
 | Slider zone | `m` |
 |---|---|
@@ -111,7 +120,8 @@ The buffer follows the extruder's motion, retractions included, at
 | at pos3 | 0.30: strong relief, and little pushed into a possible jam |
 
 **Hover.** Inside pos2 the slider drifts down very slowly (the 1% bias); when it slips just below,
-1.02 brings it back. Every filament settles at the bottom edge of pos2, so the push stays nearly
+1.02 brings it back. This holds whenever $1/1.02 < g < 1/0.99$
+([CONTROL.md, section 4](CONTROL.md#4-hovering-at-the-lower-edge-of-pos2)). Every filament settles at the bottom edge of pos2, so the push stays nearly
 constant and the slider never creeps toward pos3. In simulation that costs 0.25 to 3.5 gentle rate
 changes per 100 mm of filament.
 
@@ -133,7 +143,8 @@ upward drift is negligible. A belief proven wrong by a hard sensor reverts the t
 - *Hard hits.* Reaching pos1 or pos3 from the hover rates, and hover legs that last far longer
   than expected, nudge it by 1%.
 
-Any remaining error inside (−δ, +ε) is stable, and errors near +ε are the best case: the slider
+The derivations are in [CONTROL.md, section 5](CONTROL.md#5-learning-the-trim). Any
+remaining error inside (−δ, +ε) is stable, and errors near +ε are the best case: the slider
 barely moves. With a calibrated `rotation_distance` the feedback only compensates for the
 filament's own variation.
 
@@ -150,7 +161,8 @@ Rate changes are only issued when `m` changes, at most once every 0.2 s.
 ## Faults
 
 Distances are real extruded millimeters, so slow moves and long travels can't trigger false faults.
-Faults are armed only while synced and printing.
+Faults are armed only while synced and printing. How the distances follow from the slider geometry:
+[CONTROL.md, section 8](CONTROL.md#8-faults).
 
 | | Fault | Detection | Action |
 |---|---|---|---|
@@ -192,9 +204,9 @@ fully compressed slider hard enough to pop the PTFE tube out of its fitting.
 
 Edge times come from the sensor reports and are converted to motor and extruder positions
 (`get_past_mcu_position`, `find_past_position`), so the stopping points don't matter. The span
-from leaving pos1 to reaching pos3 is the same in both directions, because each sensor's hysteresis
-is on its clearing side, so extruder span over buffer span is the buffer's true feed per commanded
-mm. A first, unmeasured cycle takes up slack left in the tube while the motor was off. Then
+from leaving pos1 to reaching pos3 is the same in both directions as long as pos1 and pos3 have
+the same hysteresis (on the LLL Plus both are under 0.1 mm), so extruder span over buffer span is
+the buffer's true feed per commanded mm ([CONTROL.md, section 9](CONTROL.md#9-calibration)). A first, unmeasured cycle takes up slack left in the tube while the motor was off. Then
 three runs must agree within 4% (on the LLL Plus they scatter by 1 to 3% from elastic slack),
 and the median is used. The new `rotation_distance` is applied until the next restart and
 printed for the config, with the gap and band widths.

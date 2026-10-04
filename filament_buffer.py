@@ -456,9 +456,10 @@ def calibration_result(b, e):
     holding; e: extruder positions (mm) of the edges while the extruder
     pulled it back down with the buffer holding. Keys are (sensor, state).
 
-    The span from leaving pos1 to reaching pos3 is the same both ways (each
-    sensor's hysteresis is on its clearing side), so the buffer's true feed
-    per commanded mm is the extruder span over the buffer span."""
+    The span from leaving pos1 to reaching pos3 is the same both ways when
+    pos1 and pos3 have equal hysteresis, so the buffer's true feed per
+    commanded mm is the extruder span over the buffer span (docs/CONTROL.md,
+    section 9)."""
     b_span = b[("pos3", True)] - b[("pos1", False)]
     e_span = e[("pos1", True)] - e[("pos3", False)]
     if b_span <= 0.0 or e_span <= 0.0:
