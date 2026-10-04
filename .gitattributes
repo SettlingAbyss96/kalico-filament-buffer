@@ -1,0 +1,3 @@
+# Everything is deployed to Linux (Kalico on a Raspberry Pi): always LF
+* text=auto eol=lf
+*.bin binary
