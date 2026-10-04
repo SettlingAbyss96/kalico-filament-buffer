@@ -26,37 +26,40 @@ running on a Voron 2.4. Unload, a runout deadline and same-spool continuation ar
 
 ## How it works
 
+**What talks to what.** The Pi runs Kalico and this plugin. The buffer board is its own Kalico
+MCU on USB: it reads the slider sensors and drives the buffer motor.
+
 ```mermaid
-flowchart TD
-    subgraph PATH["Filament path"]
-        direction LR
-        SPOOL["Spool"] --> INLET["Inlet switch"] --> GEAR["Buffer gear"] --> SLIDER["Slider, stores slack"] --> TUBE["PTFE tube"] --> EXT["Extruder gears"] --> NOZ["Nozzle"]
-    end
-    subgraph BOARD["Buffer board: STM32F072 running Kalico"]
-        HALL["Hall sensors pos1, pos2, pos3"]
-        DRV["TMC2208 driver and motor"]
-    end
-    subgraph PI["Raspberry Pi: Kalico host"]
-        PLAN["Motion planner, runs the G-code"]
-        ZONE["filament_buffer: sensor edge to zone"]
-        RATE["Zone to multiplier m"]
-        FAULT{"Stuck at pos1 or pos3, or runout?"}
-    end
-    SLIDER -. "magnet on the slider" .-> HALL
-    HALL -- "sensor edges over USB" --> ZONE
-    ZONE --> RATE
-    RATE -- "rotation distance = base / (trim × m), no toolhead flush" --> DRV
-    PLAN -- "extruder moves, via the mainboard and toolhead board" --> EXT
-    PLAN -- "the same moves, synced" --> DRV
-    DRV --> GEAR
-    ZONE --> FAULT
-    FAULT -- "yes, while printing" --> PAUSE["PAUSE the print"]
+flowchart LR
+    PI["Raspberry Pi<br/>Kalico + plugin"] -- "USB" --> BUF["Buffer board<br/>sensors + motor"]
+    PI -- "USB / CAN" --> MB["Mainboard + toolhead<br/>extruder motor"]
 ```
 
-In practice: the extruder pulls filament and the buffer pushes it, both driven by the same
-G-code moves. Any mismatch goes into the slider. When the slider crosses a sensor, the buffer
-board reports the edge, the plugin picks a slightly faster or slower feed, and only the buffer
-motor's step size changes, so the print never pauses for it. Only a real fault does that.
+**The filament path.** The slider between the buffer and the extruder stores slack. Its spring
+pushes the filament toward the extruder, which is what assists it.
+
+```mermaid
+flowchart LR
+    A["Spool"] --> B["Buffer gear"] --> C["Slider<br/>stores slack"] --> D["Extruder"] --> E["Nozzle"]
+```
+
+**The loop during a print.** Both motors follow the same G-code moves. Only the buffer's step
+size is adjusted, so the print never slows or stops for it.
+
+```mermaid
+flowchart TD
+    A["Extruder and buffer<br/>move together"] --> B["Any difference ends up<br/>in the slider"]
+    B --> C["Slider crosses a sensor"]
+    C --> D["Buffer feeds a little<br/>faster or slower"]
+    D --> A
+```
+
+**When it pauses.** Only for a real fault, and it pauses rather than cancels.
+
+```mermaid
+flowchart LR
+    A["Stuck at pos1: tangle<br/>Stuck at pos3: jam<br/>Inlet empty: runout"] --> B["PAUSE the print"]
+```
 
 The buffer motor is an `[extruder_stepper]` synced to the extruder. Hall sensors along the slider's
 travel give the zone, and the plugin feeds slightly more or less than the extruder:
@@ -120,24 +123,34 @@ The derivations, assumptions and where every default comes from are in
   runs, about 15 mm extruded each) and applies it until the next restart. It prints the value to put in the config,
   along with the slider's sensor geometry.
 
+### Calibration, step by step
+
+With filament through the extruder and the hotend hot, `BUFFER_CALIBRATE` moves the slider up
+with one motor and back down with the other, and compares the two distances:
+
 ```mermaid
 flowchart TD
-    A["Filament loaded through the extruder, hotend hot"] --> B["Warm-up cycle: takes up slack left in the tube"]
-    B --> C["Up: the buffer feeds while the extruder holds.<br/>Buffer distance from pos1 clearing to pos3 tripping = Sb"]
-    C --> D["Down: the extruder pulls while the buffer holds.<br/>Extruder distance from pos3 clearing to pos1 tripping = Se"]
-    D --> E{"Three runs agree within 4 percent?"}
-    E -- "no" --> F["Nothing changes.<br/>Check the buffer gear for slip"]
-    E -- "yes" --> G["k = Se / Sb, the median of the runs"]
-    G --> H["rotation_distance × k: applied now,<br/>printed for the config"]
+    A["Up: buffer pushes,<br/>extruder holds"] --> B["Down: extruder pulls,<br/>buffer holds"]
+    B --> C["Compare the distances<br/>k = extruder / buffer"]
+    C --> D["Correct rotation_distance"]
 ```
 
-**Why it matters.** The slider covers the same distance in both directions, so $k$ is how much
-filament the buffer really moves per mm it is told to move, measured against the extruder.
-Everything else depends on it. Holding the slider at pos2 needs the buffer within about
-$-2\\%$ to $+1\\%$ of the extruder, and the auto-trim can only make up $\pm 5\\%$. On the first
-install the rotation distance came from the stock firmware and $k$ was 0.45: the 1.5× catch-up
-rate was really 0.68×, the slider sat at pos1 and the extrusion test aborted. After calibration
-$k$ is 1.00 to 1.03 and the same test passes.
+It runs a warm-up cycle first, then three measured runs that must agree within 4%.
+
+### Why calibration matters
+
+The slider covers the same distance both ways, so $k$ is how much filament the buffer really
+moves per mm it is told to move. Holding the slider at pos2 needs the buffer within about
+$-2\\%$ to $+1\\%$ of the extruder, and the auto-trim can only make up $\pm 5\\%$. A wrong
+`rotation_distance` is outside what the control loop can fix:
+
+```mermaid
+flowchart LR
+    A["Wrong ratio<br/>k = 0.45"] --> B["1.5x catch-up is<br/>really 0.68x"] --> C["Slider stuck<br/>at pos1"] --> D["Test aborts"]
+```
+
+That was this buffer's first install, with the value taken from the stock firmware. After
+calibration $k$ is 1.00 to 1.03 and the same extrusion test passes.
 
 ## Requirements
 
