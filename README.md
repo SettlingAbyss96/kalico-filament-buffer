@@ -149,8 +149,9 @@ flowchart LR
     A["Wrong ratio<br/>k = 0.45"] --> B["1.5x catch-up is<br/>really 0.68x"] --> C["Slider stuck<br/>at pos1"] --> D["Test aborts"]
 ```
 
-That was this buffer's first install, with the value taken from the stock firmware. After
-calibration $k$ is 1.00 to 1.03 and the same extrusion test passes.
+For example, a `rotation_distance` derived from the stock firmware's settings gives $k pprox 0.45$
+on the LLL Plus, and `BUFFER_TEST_EXTRUDE` aborts at pos1. A calibrated buffer measures within a
+few percent of $k = 1$.
 
 ## Requirements
 
