@@ -783,14 +783,43 @@ class TestLoadUnload(unittest.TestCase):
         self.mover.results = [(20.0, False), (300.0, True)]
         self.cmds["BUFFER_LOAD"](FakeGcmd())
         self.assertAlmostEqual(self.buf.path_mm, 891.4)
-        # nor does an insert that pushes a broken piece ahead of it
+        # nor does an insert that pushes a broken piece ahead of it: the fast
+        # phase hits it hard (pos3), eases off and comes up to it slowly
         self.slider(1, 0, 0)
         self.buf.fresh_insert = True
-        self.mover.results = [(20.0, False), (300.0, True)]
+        self.mover.results = [(20.0, False), (300.0, True), (-1.0, False), (28.0, True)]
         gcmd = FakeGcmd()
         self.cmds["BUFFER_LOAD"](gcmd)
         self.assertAlmostEqual(self.buf.path_mm, 891.4)
         self.assertIn("wasn't saved", gcmd.responses[-1])
+
+    def test_a_known_tip_loads_fast_then_approaches_slowly(self):
+        self.setUp({"path_mm": 900})
+        self.slider(1, 0, 0)
+        self.buf.tip_mm = 50.0  # parked by an unload
+        self.mover.results = [(20.0, False), (680.0, False), (178.6, True)]
+        self.cmds["BUFFER_LOAD"](FakeGcmd())
+        grab, fast, approach = self.mover.moves
+        self.assertEqual((fast["dist"], fast["speed"], fast["endstop"]), (680.0, 80.0, "pos3"))
+        self.assertEqual((approach["speed"], approach["endstop"]), (30.0, "pos2"))
+        self.assertIsNone(self.buf.tip_mm, "at the gears now")
+
+    def test_an_unknown_tip_loads_the_slow_way(self):
+        self.setUp({"path_mm": 900})
+        self.slider(1, 0, 0)
+        self.mover.results = [(20.0, False), (300.0, True)]
+        self.cmds["BUFFER_LOAD"](FakeGcmd())
+        self.assertEqual([m["endstop"] for m in self.mover.moves], ["pos2", "pos2"])
+        self.assertEqual(self.mover.moves[1]["speed"], 30.0)
+
+    def test_an_unload_remembers_the_park_and_a_hand_move_forgets_it(self):
+        self.setUp({"path_mm": 900})
+        self.slider(0, 1, 0)
+        self.held_unload()
+        self.cmds["BUFFER_UNLOAD"](FakeGcmd())
+        self.assertEqual(self.buf.tip_mm, 50.0)
+        self.cmds["BUFFER_MOVE"](FakeGcmd(dist=5))
+        self.assertIsNone(self.buf.tip_mm)
 
     def test_saved_lengths_are_read_at_startup_and_config_wins(self):
         printer = FakePrinter()

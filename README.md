@@ -233,9 +233,10 @@ While printing, only `BUFFER_STATUS`, `BUFFER_STATS`, `BUFFER_SET` tuning, and `
 | `autoload` | True | load to pos2 when filament is inserted into an empty buffer |
 | `autoload_delay` | 1 s | wait after the inlet switch closes |
 | `load_speed`, `load_max_mm` | 30 mm/s, 1500 mm | loading speed and the longest path it will feed |
+| `load_fast_speed`, `load_approach_mm` | 80 mm/s, 150 mm | with the path and the tip's position known, a load covers the way at `load_fast_speed` and only the last `load_approach_mm` at `load_speed` |
 | `load_grab_mm`, `load_grab_speed` | 20 mm, 10 mm/s | slow start so the gear catches the filament |
 | `button_speed` | 20 mm/s | hold-to-move speed |
-| `max_move_speed`, `move_accel` | 60 mm/s, 500 mm/s² | independent moves |
+| `max_move_speed`, `move_accel` | 120 mm/s, 500 mm/s² | independent moves (the LLL Plus ran clean to 150 mm/s at 0.3 A) |
 | `m_pos1`, `m_approach_below`, `m_below`, `m_target`, `m_above`, `m_approach_above`, `m_pos3` | 1.50, 1.15, 1.02, 0.99, 0.98, 0.85, 0.30 | zone multipliers |
 | `tension_fault_mm`, `compression_fault_mm` | 60, 25 | extruded mm stuck at pos1 / pos3 before PAUSE |
 | `trim_limit`, `trim_gain`, `trim_nudge` | 0.05, 0.5, 0.01 | auto-trim bounds, learning gain, nudge size |
@@ -252,7 +253,7 @@ can't drift from them.
 
 ## Testing
 
-- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 68 tests:
+- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 71 tests:
   - A physical model of the slider, with the sensor geometry measured on a real LLL Plus, drives
     the real controller: retractions up to 1 mm, flow up to 15 mm/s, ratio errors ±4%, sensor
     noise, slow rate application, other sensor geometries and layouts, mid-print filament changes,

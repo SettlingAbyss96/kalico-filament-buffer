@@ -719,7 +719,8 @@ class FilamentBuffer:
         self.extruder_name = config.get("extruder", "extruder")
         self.report_events = config.getboolean("report_events", True)
         self.button_speed = config.getfloat("button_speed", 20.0, above=0.0)
-        self.max_move_speed = config.getfloat("max_move_speed", 60.0, above=0.0)
+        # tested clean to 150 mm/s at 0.3 A on the LLL Plus (BUFFER_TEST_SPEED)
+        self.max_move_speed = config.getfloat("max_move_speed", 120.0, above=0.0)
         self.move_accel = config.getfloat("move_accel", 500.0, minval=0.0)
         # Loading (autoload on insert, or BUFFER_LOAD): feed until the slider
         # reaches pos2, which means the tip is pressed against the extruder
@@ -731,6 +732,13 @@ class FilamentBuffer:
         self.load_max_mm = config.getfloat(
             "load_max_mm", 1500.0, above=0.0, maxval=JOG_MAX_MM
         )
+        # With the path and the tip's position known, a load covers most of
+        # the way at load_fast_speed and only the last load_approach_mm at
+        # load_speed, so the contact stays gentle and exact
+        self.load_fast_speed = config.getfloat(
+            "load_fast_speed", 80.0, above=0.0, maxval=self.max_move_speed
+        )
+        self.load_approach_mm = config.getfloat("load_approach_mm", 150.0, above=0.0)
         self.load_grab_mm = config.getfloat("load_grab_mm", 20.0, minval=0.0)
         self.load_grab_speed = config.getfloat(
             "load_grab_speed", 10.0, above=0.0, maxval=self.max_move_speed
@@ -858,6 +866,8 @@ class FilamentBuffer:
         self.unloading = False
         self.keep_motor = False  # sequences that need the motor held between moves
         self.fresh_insert = False  # the next load starts with the tip at the inlet
+        # where the tip is, in mm from the inlet, when we know (None: don't)
+        self.tip_mm = None
         # Klipper reports every input at startup. Only an inlet seen empty and
         # then filled is an insert; filament that was already there is not
         self.inlet_was_empty = False
@@ -929,6 +939,9 @@ class FilamentBuffer:
             return
         if self.cfg_path_mm is None and saved.get("buffer_path_mm"):
             self.path_mm = float(saved["buffer_path_mm"])
+        tip = saved.get("buffer_tip_mm")
+        if tip is not None and tip >= 0.0:
+            self.tip_mm = float(tip)
         if self.cfg_nozzle_mm is None and saved.get("buffer_nozzle_mm"):
             self.nozzle_mm = float(saved["buffer_nozzle_mm"])
 
@@ -951,6 +964,17 @@ class FilamentBuffer:
             gcmd.respond_info(
                 "buffer: add [save_variables] to keep the %s length across"
                 " restarts, or put %s_mm: %.0f in [filament_buffer]" % (what, what, value)
+            )
+
+    def _set_tip(self, tip_mm):
+        """Remember where the tip is (None: unknown), across restarts too."""
+        if tip_mm == self.tip_mm:
+            return
+        self.tip_mm = tip_mm
+        if self.printer.lookup_object("save_variables", None) is not None:
+            self.gcode.run_script_from_command(
+                "SAVE_VARIABLE VARIABLE=buffer_tip_mm VALUE=%.1f"
+                % (-1.0 if tip_mm is None else tip_mm)
             )
 
     # --- motor power -----------------------------------------------------
@@ -1188,6 +1212,7 @@ class FilamentBuffer:
                 if key is None or self._is_printing():
                     return
                 feed = key == "key_feed"
+                self.tip_mm = None  # moved by hand (saved on the next load or unload)
                 moved, at_pos3 = self._idle_move(
                     JOG_MAX_MM if feed else -JOG_MAX_MM,
                     self.button_speed,
@@ -1334,6 +1359,7 @@ class FilamentBuffer:
 
     def cmd_BUFFER_MOVE(self, gcmd):
         self._require_not_printing(gcmd, "BUFFER_MOVE")
+        self._set_tip(None)
         dist = gcmd.get_float("DIST")
         speed = gcmd.get_float(
             "SPEED", self.button_speed, above=0.0, maxval=self.max_move_speed
@@ -1386,6 +1412,11 @@ class FilamentBuffer:
         )
         max_mm = gcmd.get_float("MAX", self.load_max_mm, above=0.0, maxval=JOG_MAX_MM)
         at_rest = self.pin_states.get("pos1")
+        tip = 0.0 if measure else self.tip_mm
+        # fast for whatever is known to be clear of the gears
+        fast = 0.0
+        if self.path_mm and tip is not None:
+            fast = self.path_mm - tip - self.load_approach_mm
         self.loading, self.load_cancel = True, False
         self.inlet_clear_since = None
         start = self.reactor.monotonic()
@@ -1395,6 +1426,21 @@ class FilamentBuffer:
             moved, hit = self._idle_move(
                 grab, self.load_grab_speed, endstop_key="pos2", abort=self._load_abort
             )
+            if not hit and fast - moved > 50.0 and not self._load_abort():
+                # only a hard stop ends this early: pos3, not pos2, so friction
+                # or a snag at speed can't pass for the gears
+                more, hard = self._idle_move(
+                    fast - moved, self.load_fast_speed, endstop_key="pos3",
+                    abort=self._load_abort,
+                )
+                moved += more
+                if hard or self.pin_states.get("pos2"):
+                    # stopped short: ease off and come up to the gears slowly
+                    back, _ = self._idle_move(
+                        -15.0, 5.0, abort=lambda: not self.pin_states.get("pos2")
+                    )
+                    moved += back
+                    self._settle()
             if not hit and not self._load_abort() and max_mm > moved:
                 more, hit = self._idle_move(
                     max_mm - moved, speed, endstop_key="pos2", abort=self._load_abort
@@ -1405,6 +1451,7 @@ class FilamentBuffer:
         secs = self.reactor.monotonic() - start
         if hit:
             self.last_load_mm = moved
+            self._set_tip(None)  # at the gears now; an unload sets it again
             gcmd.respond_info(
                 "buffer: loaded, pos2 reached after %.0f mm (%.0f s). The tip is at"
                 " the extruder gears." % (moved, secs)
@@ -1565,6 +1612,7 @@ class FilamentBuffer:
             pull = min(pull, JOG_MAX_MM)
             self._idle_move(-pull, self.load_speed)
             back += pull
+            self._set_tip(park if (path is not None and not eject) else None)
             gcmd.respond_info(
                 "buffer: unloaded, %s. About %.0f mm of filament went back out of"
                 " the inlet toward the spool, which doesn't turn by itself: wind it"
@@ -2152,6 +2200,7 @@ class FilamentBuffer:
         )
         trip = self.pos2_slack_mm + dist
         lines = []
+        self._set_tip(None)
         self.keep_motor = True
         try:
             # the tip must be free: a short pull and the free test bound any

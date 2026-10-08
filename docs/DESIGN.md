@@ -199,6 +199,13 @@ path also measures it: everything fed beyond the slack the slider now holds is t
 inlet to the extruder gears. A reading more than 50 mm off the known path isn't saved, since that
 means something was already in the tube ahead of the tip, like a broken piece.
 
+Once the path is known, and the plugin knows where the tip starts (at the inlet after an insert,
+at the park after an unload; a hand move forgets it), a load covers the way at 80 mm/s and only the
+last 150 mm at 30. The fast part stops on pos3, not pos2: with a metre of filament dragging through
+the tube the slider already sits past pos1 at 30 mm/s, so friction or a snag at speed mustn't pass
+for the gears. If it does stop early, it eases off and comes up to the gears slowly. The motor itself
+isn't the limit: round trips at up to 150 mm/s came back to contact within 2 mm at 0.3 A.
+
 `BUFFER_LOAD TO=nozzle` carries on from there with the buffer synced: 10 mm at 2 mm/s so the gears
 grab the tip, then the gears-to-nozzle length plus a 15 mm margin, then the purge. Feeding too far
 only purges a bit more, so the margin is cheap. Every 10 mm it checks the slider, and if it sits
@@ -265,7 +272,7 @@ printed for the config, with the gap and band widths.
 | Layer | What it proves |
 |---|---|
 | `tests/test_controller.py` (31 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs. Unloading: forward multipliers on a long retraction pull against the extruder, holding pos2 leaves the spring pressing on the tip at the release, a relaxed follow never pushes and carries the tip away by the expected length |
-| `tests/test_adapter.py` (37 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, contact first from a relaxed slider; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
+| `tests/test_adapter.py` (40 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, contact first from a relaxed slider; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
 | `config/buffer-test.cfg` | Hardware: sensors, TMC link, LEDs, sync, motor direction |
 | `BUFFER_TEST_SLACK`, `BUFFER_TEST_SPEED` | The path itself: the dead band between the buffer and the extruder gears, and the fastest feed that doesn't skip at a given motor current |
 | `BUFFER_TEST_EXTRUDE` | Synced extrusion into the air at several speeds with 1 mm retractions. Checks the buffer every 25 mm and aborts safely when filament isn't consumed, isn't fed, or runs out |
