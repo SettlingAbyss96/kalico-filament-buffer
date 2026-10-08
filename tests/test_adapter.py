@@ -481,6 +481,7 @@ class TestHardRule(unittest.TestCase):
         for name, params in (("BUFFER_MOVE", {"dist": 10}), ("BUFFER_UNSYNC", {}),
                              ("BUFFER_SYNC", {}), ("BUFFER_TEST_EXTRUDE", {"dry_run": 1}),
                              ("BUFFER_LOAD", {}), ("BUFFER_UNLOAD", {}),
+                             ("BUFFER_TEST_SLACK", {}), ("BUFFER_TEST_SPEED", {}),
                              ("BUFFER_CALIBRATE", {}),
                              ("BUFFER_SET", {"rotation_distance": 6.3})):
             # UNSYNC only does anything when synced; SYNC only when unsynced
@@ -811,6 +812,73 @@ class TestLoadUnload(unittest.TestCase):
         self.assertAlmostEqual(total, 10.0 + (65.0 + 15.0 - 10.0) + 30.0)
         self.assertTrue(fed[0].startswith("G1 E10.000 F120"), "grab the tip slowly first")
         self.assertFalse(self.buf.synced)
+
+
+class TestPathTests(unittest.TestCase):
+    """BUFFER_TEST_SLACK and BUFFER_TEST_SPEED."""
+
+    def setUp(self):
+        self.printer, self.buf = make_buffer()
+        self.pins = self.printer.objects["buttons"].pins
+        self.cmds = self.printer.objects["gcode"].commands
+        self.mover = self.buf.mover
+        self.press("!buffer:PB7", 1)
+
+    def press(self, pin, state):
+        self.printer.reactor.now += 0.05
+        self.pins[pin](self.printer.reactor.now, state)
+
+    def slider(self, pos1, pos2, pos3):
+        for pin, state in (("buffer:PB4", pos1), ("buffer:PB3", pos2), ("buffer:PB2", pos3)):
+            self.press(pin, state)
+
+    def test_dead_band_and_spans(self):
+        up = {("pos1", False): 100.0, ("pos2", True): 110.0, ("pos3", True): 114.6}
+        down = {("pos3", False): 113.0, ("pos2", False): 108.2, ("pos1", True): 98.5}
+        dead, span_up, span_down = fb.slack_result(up, down)
+        self.assertAlmostEqual(dead["pos1"], 1.5)
+        self.assertAlmostEqual(dead["pos2"], 1.8)
+        self.assertAlmostEqual(dead["pos3"], 1.6)
+        self.assertAlmostEqual(span_up, 14.6)
+        self.assertAlmostEqual(span_down, 14.5)
+
+    def test_speed_test_checks_the_tip_is_free_then_stops_at_the_first_skip(self):
+        self.slider(0, 1, 0)  # tip resting on the gears, slider at pos2
+        self.mover.on_move = lambda dist: dist < 0 and self.slider(1, 0, 0)
+        trip = 28.6 + 80.0
+        self.mover.results = [
+            (-1.0, False), (1.0, True),  # contact
+            (-50.6, False), (22.0, False),  # short pull, free test
+            (31.6, True),  # contact again
+            (-trip, False), (trip, True), (-trip, False), (trip + 0.4, True),  # 30 mm/s
+            (-trip, False), (trip + 16.0, True),  # 45 mm/s: lost steps
+        ]
+        gcmd = FakeGcmd(speeds="30,45,60")
+        self.cmds["BUFFER_TEST_SPEED"](gcmd)
+        out = gcmd.responses[-1]
+        self.assertIn("30 mm/s: back at contact +0.0 mm, +0.4 mm", out)
+        self.assertIn("stopped: the motor lost steps at 45 mm/s", out)
+        self.assertNotIn("60 mm/s", out)
+        # the free test came before any full-length trip
+        dists = [m["dist"] for m in self.mover.moves]
+        self.assertEqual(dists[3], 22.0)
+        self.assertLess(abs(dists[2]), 60.0)
+
+    def test_speed_test_refuses_a_tip_still_in_the_extruder(self):
+        self.slider(0, 1, 0)
+
+        def on_move(dist):
+            if dist == 22.0:
+                self.slider(0, 0, 0)  # the free test compresses: still held
+            elif dist < 0:
+                self.slider(1, 0, 0)
+
+        self.mover.on_move = on_move
+        self.mover.results = [(-1.0, False), (1.0, True), (-50.6, False), (22.0, False)]
+        with self.assertRaises(CommandError) as ctx:
+            self.cmds["BUFFER_TEST_SPEED"](FakeGcmd())
+        self.assertIn("BUFFER_TEST_SPEED: the tip is not free", str(ctx.exception))
+        self.assertEqual(len(self.mover.moves), 4, "no trips after a failed free test")
 
 
 class TestCalibrationMath(unittest.TestCase):

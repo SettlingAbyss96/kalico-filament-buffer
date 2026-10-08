@@ -30,6 +30,7 @@ NOZZLE_MARGIN_MM = 15.0  # extra feed past the nozzle estimate on a load
 MIN_NOZZLE_MM = 20.0  # a shorter release means the filament wasn't in the hotend
 MIN_PATH_MM = 100.0  # a shorter autoload isn't a full path measurement
 PATH_AGREE_MM = 50.0  # a new path reading this far off the known one isn't saved
+TEST_SPEED_MAX = 150.0  # BUFFER_TEST_SPEED may go past max_move_speed, not past this
 
 # Unloading runs the buffer at a fixed multiplier, not the zone control: the
 # slider stays relaxed so nothing presses the tip into the gears (DESIGN.md)
@@ -502,6 +503,34 @@ def calibration_result(b, e):
     return ratio, geometry
 
 
+def slack_result(up, down):
+    """BUFFER_TEST_SLACK math. up, down: buffer positions (mm) of each
+    (sensor, state) edge while the buffer drove the slider up to pos3 and back
+    down to pos1 with the far end held. A rigid path trips every sensor at
+    the same buffer position both ways; the difference is the dead band in
+    the path (filament snaking in the tube, friction, gear backlash). Returns
+    that per sensor, and the pos1-to-pos3 span each way."""
+    pairs = (
+        ("pos1", ("pos1", False), ("pos1", True)),
+        ("pos2", ("pos2", True), ("pos2", False)),
+        ("pos3", ("pos3", True), ("pos3", False)),
+    )
+    dead = {}
+    for name, u, d in pairs:
+        if u in up and d in down:
+            dead[name] = up[u] - down[d]
+    span_up = up[("pos3", True)] - up[("pos1", False)]
+    span_down = down[("pos3", False)] - down[("pos1", True)]
+    return dead, span_up, span_down
+
+
+def _mean_sd(values):
+    n = len(values)
+    mean = sum(values) / n
+    sd = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1)) if n > 1 else 0.0
+    return mean, sd
+
+
 ######################################################################
 # Independent buffer moves (idle only)
 ######################################################################
@@ -855,6 +884,8 @@ class FilamentBuffer:
             "BUFFER_CALIBRATE",
             "BUFFER_SET",
             "BUFFER_TEST_EXTRUDE",
+            "BUFFER_TEST_SLACK",
+            "BUFFER_TEST_SPEED",
         ):
             self.gcode.register_command(
                 cmd,
@@ -1597,7 +1628,7 @@ class FilamentBuffer:
             self._do_sync(False)
             run("RESTORE_GCODE_STATE NAME=_buffer_unload")
 
-    def _free_test(self, gcmd, test):
+    def _free_test(self, gcmd, test, what="BUFFER_UNLOAD"):
         """A free tip slides forward without compressing the slider. One held
         above the gears (a swollen tip at the PTFE, say) compresses it past
         the top of pos1. Checked before any long pull."""
@@ -1605,10 +1636,10 @@ class FilamentBuffer:
         self._settle()
         if hit or not self.pin_states.get("pos1"):
             raise gcmd.error(
-                "BUFFER_UNLOAD: the tip is not free. Feeding %.0f mm compressed the"
-                " slider, so something still holds it: a tip that won't go up past"
-                " the gears, or a gears-to-nozzle length longer than MAX= allows."
-                " Stopped before the long pull" % test
+                "%s: the tip is not free. Feeding %.0f mm compressed the slider, so"
+                " something still holds it: a tip that won't go up past the gears,"
+                " or one still in the extruder. Stopped before the long pull"
+                % (what, test)
             )
 
     # --- calibration -----------------------------------------------------
@@ -2019,6 +2050,142 @@ class FilamentBuffer:
                 self._motor_off()
             run("RESTORE_GCODE_STATE NAME=_buffer_test")
         gcmd.respond_info("\n".join("buffer test: " + l for l in lines))
+
+    # --- path slack and feed speed tests ----------------------------------
+    cmd_BUFFER_TEST_SLACK_help = (
+        "Measure the slack in the filament path: with the extruder holding the"
+        " filament, drive the slider from pos1 to pos3 and back CYCLES times and"
+        " report where each sensor trips each way. [CYCLES=5] [SPEED=3]. Needs"
+        " filament loaded through the extruder. Not while printing."
+    )
+
+    def _last_edges(self, log):
+        edges = {}
+        for key, state, et in log:
+            edges[(key, state)] = self._buffer_mm_at(et)
+        return edges
+
+    def cmd_BUFFER_TEST_SLACK(self, gcmd):
+        self._require_not_printing(gcmd, "BUFFER_TEST_SLACK")
+        cycles = gcmd.get_int("CYCLES", 5, minval=1, maxval=20)
+        speed = gcmd.get_float("SPEED", 3.0, above=0.0, maxval=20.0)
+        if self.synced:
+            raise gcmd.error("BUFFER_TEST_SLACK: the buffer is synced; BUFFER_UNSYNC first")
+        if not self.pin_states.get("inlet"):
+            raise gcmd.error("BUFFER_TEST_SLACK: no filament at the buffer inlet")
+        run = self.gcode.run_script_from_command
+        # the extruder gears hold the far end still
+        run("SET_STEPPER_ENABLE STEPPER=%s ENABLE=1" % self.extruder_name)
+        at_pos1 = lambda: self.pin_states.get("pos1")
+        runs = []
+        self.keep_motor = True
+        try:
+            # start a little below the top of pos1, still compressed
+            if not at_pos1():
+                self._idle_move(-40.0, speed, abort=at_pos1)
+            self._idle_move(-3.0, speed)
+            self._settle()
+            if not at_pos1():
+                raise gcmd.error("BUFFER_TEST_SLACK: the slider did not come down to pos1")
+            for i in range(cycles):
+                self.edge_log = []
+                moved, hit = self._idle_move(40.0, speed, endstop_key="pos3")
+                if not hit:
+                    raise gcmd.error(
+                        "BUFFER_TEST_SLACK: pos3 not reached after %.0f mm. Is the"
+                        " filament loaded through the extruder?" % moved
+                    )
+                self._idle_move(1.0, speed)
+                self._settle()
+                up, self.edge_log = self.edge_log, []
+                self._idle_move(-40.0, speed, abort=at_pos1)
+                self._idle_move(-3.0, speed)
+                self._settle()
+                down, self.edge_log = self.edge_log, None
+                try:
+                    runs.append(slack_result(self._last_edges(up), self._last_edges(down)))
+                except KeyError:
+                    raise gcmd.error(
+                        "BUFFER_TEST_SLACK: unexpected sensor sequence (up %s, down %s)"
+                        % ([(k, s) for k, s, t in up], [(k, s) for k, s, t in down])
+                    )
+        finally:
+            self.edge_log = None
+            self.keep_motor = False
+            self._motor_off()
+        lines = ["%d cycles at %.1f mm/s, buffer mm (mean, sd):" % (len(runs), speed)]
+        for name in ("pos1", "pos2", "pos3"):
+            vals = [d[name] for d, su, sd_ in runs if name in d]
+            if vals:
+                lines.append(
+                    "dead band at %s: %.2f, %.2f (up minus down)" % ((name,) + _mean_sd(vals))
+                )
+        lines.append("span pos1 to pos3 going up: %.2f, %.2f" % _mean_sd([su for d, su, sd_ in runs]))
+        lines.append("span pos3 to pos1 coming down: %.2f, %.2f" % _mean_sd([sd_ for d, su, sd_ in runs]))
+        gcmd.respond_info("\n".join("buffer slack: " + l for l in lines))
+
+    cmd_BUFFER_TEST_SPEED_help = (
+        "Find how fast the buffer feeds without skipping: round trips from contact"
+        " at the extruder gears, out DIST and back, at each speed. A skipping"
+        " motor comes back short or long. [SPEEDS=30,45,60,80,100] [DIST=80]"
+        " [CYCLES=2]. Needs the tip free above the gears with DIST of room (after"
+        " a short BUFFER_UNLOAD). Each trip sends DIST toward the spool and takes"
+        " it back. Not while printing."
+    )
+
+    def cmd_BUFFER_TEST_SPEED(self, gcmd):
+        self._require_not_printing(gcmd, "BUFFER_TEST_SPEED")
+        dist = gcmd.get_float("DIST", 80.0, minval=10.0, maxval=300.0)
+        cycles = gcmd.get_int("CYCLES", 2, minval=1, maxval=10)
+        try:
+            speeds = [float(v) for v in gcmd.get("SPEEDS", "30,45,60,80,100").split(",")]
+        except ValueError:
+            raise gcmd.error("SPEEDS must be a comma separated list of mm/s")
+        if not speeds or min(speeds) <= 0.0 or max(speeds) > TEST_SPEED_MAX:
+            raise gcmd.error("SPEEDS must be within 0 < speed <= %.0f mm/s" % TEST_SPEED_MAX)
+        if self.synced:
+            raise gcmd.error("BUFFER_TEST_SPEED: the buffer is synced; BUFFER_UNSYNC first")
+        if not self.pin_states.get("inlet"):
+            raise gcmd.error("BUFFER_TEST_SPEED: no filament at the buffer inlet")
+        self.gcode.run_script_from_command(
+            "SET_STEPPER_ENABLE STEPPER=%s ENABLE=1" % self.extruder_name
+        )
+        trip = self.pos2_slack_mm + dist
+        lines = []
+        self.keep_motor = True
+        try:
+            # the tip must be free: a short pull and the free test bound any
+            # slip to a few cm if it's still in the extruder after all
+            self._contact(gcmd, self.path_mm)
+            test = self.unload_test_mm
+            self._idle_move(-(self.pos2_slack_mm + test + 3.0), self.load_grab_speed)
+            self._free_test(gcmd, test, "BUFFER_TEST_SPEED")
+            self._contact(gcmd, self.path_mm)
+            for v in speeds:
+                errs = []
+                for i in range(cycles):
+                    self._idle_move(-trip, v)
+                    moved, hit = self._idle_move(trip + 40.0, v, endstop_key="pos2")
+                    errs.append(moved - trip if hit else None)
+                    if not hit or abs(moved - trip) > 10.0:
+                        break
+                ok = [e for e in errs if e is not None]
+                lines.append(
+                    "%5.0f mm/s: back at contact %s"
+                    % (v, ", ".join("%+.1f mm" % e if e is not None else "never" for e in errs))
+                )
+                if len(ok) < len(errs) or any(abs(e) > 10.0 for e in ok):
+                    lines.append("stopped: the motor lost steps at %.0f mm/s" % v)
+                    break
+        finally:
+            self.keep_motor = False
+            self._motor_off()
+        gcmd.respond_info(
+            "\n".join(
+                ["buffer speed: round trips of %.0f mm (contact to %.0f mm up and back)" % (trip, dist)]
+                + ["buffer speed: " + l for l in lines]
+            )
+        )
 
     def get_status(self, eventtime):
         c = self.ctrl

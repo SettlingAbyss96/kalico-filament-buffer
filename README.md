@@ -206,6 +206,8 @@ managed_services: klipper
 | `BUFFER_MOVE DIST= [SPEED=]` | move the buffer on its own; feeding stops early at pos3 |
 | `BUFFER_SET ...` | runtime tuning (multipliers, fault distances, trim, `BAND_MM`, `REPORT_EVENTS=0/1`, `ROTATION_DISTANCE`) |
 | `BUFFER_TEST_EXTRUDE [TEMP=] [LENGTH=300] [SPEEDS=1.5,3,5] [RETRACT=1.0] [DRY_RUN=1] [CHECK_Z=0] ...` | automated synced-extrusion test: syncs, extrudes in segments with retractions, checks the buffer every 25 mm (aborts safely on anomalies), reports PASS/CHECK with statistics. `CHECK_Z=0` skips the homing check when you know the nozzle is clear of the bed |
+| `BUFFER_TEST_SLACK [CYCLES=5] [SPEED=3]` | with the extruder holding the filament, drives the slider pos1 to pos3 and back and reports where each sensor trips each way: the dead band in the path (filament snaking in the tube, friction, backlash) and the spans |
+| `BUFFER_TEST_SPEED [SPEEDS=30,45,60,80,100] [DIST=80] [CYCLES=2]` | how fast the buffer feeds without skipping: from contact at the gears, round trips out `DIST` and back at each speed, stopping at the first that comes back off. Checks the tip is free first. May go past `max_move_speed`, up to 150 mm/s |
 
 While printing, only `BUFFER_STATUS`, `BUFFER_STATS`, `BUFFER_SET` tuning, and `BUFFER_SYNC` /
 `BUFFER_UNSYNC` with the toolhead stopped (in `PRINT_START` and `PRINT_END`) are accepted.
@@ -250,7 +252,7 @@ can't drift from them.
 
 ## Testing
 
-- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 64 tests:
+- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 68 tests:
   - A physical model of the slider, with the sensor geometry measured on a real LLL Plus, drives
     the real controller: retractions up to 1 mm, flow up to 15 mm/s, ratio errors ±4%, sensor
     noise, slow rate application, other sensor geometries and layouts, mid-print filament changes,

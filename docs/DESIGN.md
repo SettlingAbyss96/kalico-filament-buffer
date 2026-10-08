@@ -265,8 +265,9 @@ printed for the config, with the gap and band widths.
 | Layer | What it proves |
 |---|---|
 | `tests/test_controller.py` (31 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs. Unloading: forward multipliers on a long retraction pull against the extruder, holding pos2 leaves the spring pressing on the tip at the release, a relaxed follow never pushes and carries the tip away by the expected length |
-| `tests/test_adapter.py` (33 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, contact first from a relaxed slider; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
+| `tests/test_adapter.py` (37 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, contact first from a relaxed slider; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
 | `config/buffer-test.cfg` | Hardware: sensors, TMC link, LEDs, sync, motor direction |
+| `BUFFER_TEST_SLACK`, `BUFFER_TEST_SPEED` | The path itself: the dead band between the buffer and the extruder gears, and the fastest feed that doesn't skip at a given motor current |
 | `BUFFER_TEST_EXTRUDE` | Synced extrusion into the air at several speeds with 1 mm retractions. Checks the buffer every 25 mm and aborts safely when filament isn't consumed, isn't fed, or runs out |
 | Planned | A full test print with the buffer active: `print_stall` stays 0 and print time matches a run without it |
 
