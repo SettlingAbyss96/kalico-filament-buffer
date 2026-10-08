@@ -687,7 +687,9 @@ class TestLoadUnload(unittest.TestCase):
         self.assertAlmostEqual(dists[2], -(28.6 - 2.0), msg="relax before retracting")
         self.assertEqual((dists[3], self.mover.moves[3]["endstop"]), (22.0, "pos2"))
         self.assertAlmostEqual(dists[-1], -(28.6 + 900.0 - 50.0), msg="pull from contact")
-        self.assertIn("850 mm of filament went back", self.gcmd_last)
+        # net back toward the spool: relax 26.6 + retract 1.02 * 142 - test 22 - contact 88.6
+        # + pull 878.6
+        self.assertIn("939 mm of filament went back", self.gcmd_last)
         # the buffer followed a hair faster than the extruder during the retraction
         self.assertIn(6.3 / fb.UNLOAD_FOLLOW, self.buf.mcu_stepper.rd_history)
         # the tip ended 88.6 - 28.6 + 22 = 82 mm above the gears

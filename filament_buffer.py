@@ -1487,19 +1487,27 @@ class FilamentBuffer:
             )
         self._heat_for(gcmd, "BUFFER_UNLOAD")
         self.unloading = self.keep_motor = True
+        # filament the buffer sends back out of the inlet toward the spool,
+        # which doesn't turn by itself: everything it retracts minus what it feeds
+        back = 0.0
         try:
             # 1. Contact: the slider at the lower edge of pos2, a known slack
-            self._contact(gcmd, path)
+            back -= self._contact(gcmd, path)
             # 2. Relax: nothing may press on the filament at the gears
-            self._idle_move(-(self.pos2_slack_mm - RELAX_LEAVE_MM), self.load_grab_speed)
+            relax = self.pos2_slack_mm - RELAX_LEAVE_MM
+            self._idle_move(-relax, self.load_grab_speed)
+            back += relax
             # 3. Retract with the buffer following, a hair faster
             self._retract_relaxed(max_mm)
+            back += self.ctrl.trim * UNLOAD_FOLLOW * (max_mm - self.unload_ram_mm)
             # 4. The free test
             self._free_test(gcmd, test)
+            back -= test
             # 5. Contact again. The feed it takes says where the tip was, so
             # the park needs no estimate, and how far the buffer carried the
             # tip past the gears gives the gears-to-nozzle length
             fed = self._contact(gcmd, path)
+            back -= fed
             above = fed - self.pos2_slack_mm + test
             nozzle = max_mm - above / UNLOAD_FOLLOW
             if MIN_NOZZLE_MM <= nozzle <= max_mm - 5.0:
@@ -1511,28 +1519,25 @@ class FilamentBuffer:
                 gcmd.respond_info("buffer: the filament wasn't through the hotend")
             # 6. Pull back from contact: the slack first, then the tip
             if path is None:
-                self._idle_move(-(self.pos2_slack_mm + 100.0), self.load_speed)
-                gcmd.respond_info(
-                    "buffer: the tip is free and about 100 mm above the extruder"
-                    " gears. The path length isn't known yet (autoload measures it,"
-                    " or pass PATH=), so it was not pulled further"
+                pull = self.pos2_slack_mm + 100.0
+                where = (
+                    "the tip is free and about 100 mm above the extruder gears. The"
+                    " path length isn't known yet (autoload measures it, or pass"
+                    " PATH=), so it was not pulled further"
                 )
-                return
-            if eject:
+            elif eject:
                 pull = self.pos2_slack_mm + path + self.eject_margin_mm
+                where = "the tip is out past the buffer gear"
             else:
                 pull = self.pos2_slack_mm + path - park
-            self._idle_move(-min(pull, JOG_MAX_MM), self.load_speed)
+                where = "the tip is parked about %.0f mm past the buffer inlet" % park
+            pull = min(pull, JOG_MAX_MM)
+            self._idle_move(-pull, self.load_speed)
+            back += pull
             gcmd.respond_info(
                 "buffer: unloaded, %s. About %.0f mm of filament went back out of"
                 " the inlet toward the spool, which doesn't turn by itself: wind it"
-                " back before loading again, or it tangles"
-                % (
-                    "the tip is out past the buffer gear"
-                    if eject
-                    else "the tip is parked about %.0f mm past the buffer inlet" % park,
-                    pull - self.pos2_slack_mm,
-                )
+                " back before loading again, or it tangles" % (where, back)
             )
         finally:
             self.unloading = self.keep_motor = False
