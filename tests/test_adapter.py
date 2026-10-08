@@ -656,82 +656,77 @@ class TestLoadUnload(unittest.TestCase):
         for pin, state in (("buffer:PB4", pos1), ("buffer:PB3", pos2), ("buffer:PB2", pos3)):
             self.press(pin, state)
 
-    def release_on_retract(self, after_mm=75.0):
-        """The extruder lets go during the reverse retraction."""
-        orig = self.gcode.run_script_from_command
+    def held_unload(self, fed_contact=88.6):
+        """Scripted moves for an unload that starts held at pos2: ease back,
+        contact, relax, free test, contact again (then the pull)."""
+        self.mover.results = [(-1.0, False), (1.0, True), (-26.6, False),
+                              (22.0, False), (fed_contact, True)]
+        self.mover.on_move = lambda dist: dist < 0 and self.slider(1, 0, 0)
 
-        def run(script):
-            orig(script)
-            if "G1 E-" in script and self.buf.ctrl.reverse:
-                self.slider(1, 0, 0)
-                self.buf.ctrl.release_e = -after_mm
-
-        self.gcode.run_script_from_command = run
-
-    def test_unload_retracts_in_reverse_tests_then_parks(self):
+    def test_unload_relaxes_retracts_tests_then_parks(self):
         self.setUp({"path_mm": 900})
         self.slider(0, 1, 0)  # held at pos2: the filament is in the extruder
-        self.release_on_retract(75.0)
+        self.held_unload(fed_contact=88.6)
         self.cmds["BUFFER_UNLOAD"](FakeGcmd(temp=210))
         scripts = self.gcode.scripts
         self.assertIn("M109 S210.0", scripts)
         self.assertIn("G1 E3.000 F300\nM400", scripts)
-        # one continuous retraction: fast out of the hot zone, then steady
-        self.assertIn("G1 E-25.000 F2100.0\nG1 E-175.000 F1200.0\nM400", scripts)
-        test, pull = self.mover.moves
-        self.assertEqual((test["dist"], test["endstop"]), (22.0, "pos2"))
-        # the tip ends about clear - pos1 slack - test = 8 mm above the gears
-        self.assertAlmostEqual(pull["dist"], -(900.0 - 8.0 - 50.0))
-        self.assertAlmostEqual(self.buf.nozzle_mm, 75.0 - (28.6 - 19.0))
+        # one continuous retraction, 100 mm assumed to the nozzle + 45 overrun
+        self.assertIn("G1 E-25.000 F2100.0\nG1 E-120.000 F1200.0\nM400", scripts)
+        dists = [m["dist"] for m in self.mover.moves]
+        self.assertAlmostEqual(dists[2], -(28.6 - 2.0), msg="relax before retracting")
+        self.assertEqual((dists[3], self.mover.moves[3]["endstop"]), (22.0, "pos2"))
+        self.assertAlmostEqual(dists[-1], -(28.6 + 900.0 - 50.0), msg="pull from contact")
+        # the buffer followed a hair faster than the extruder during the retraction
+        self.assertIn(6.3 / fb.UNLOAD_FOLLOW, self.buf.mcu_stepper.rd_history)
+        # the tip ended 88.6 - 28.6 + 22 = 82 mm above the gears
+        self.assertAlmostEqual(self.buf.nozzle_mm, 145.0 - 82.0 / fb.UNLOAD_FOLLOW)
         self.assertFalse(self.buf.synced)
+        self.assertIsNone(self.buf.ctrl.follow)
         self.assertFalse(self.buf.unloading)
         self.assertEqual(self.enable.calls[-1], (("extruder_stepper buffer",), False))
 
     def test_unload_eject_pulls_past_the_buffer_gear(self):
         self.setUp({"path_mm": 900})
         self.slider(0, 1, 0)
-        self.release_on_retract()
+        self.held_unload()
         self.cmds["BUFFER_UNLOAD"](FakeGcmd(eject=1))
-        self.assertAlmostEqual(self.mover.moves[-1]["dist"], -(900.0 - 8.0 + 60.0))
+        self.assertAlmostEqual(self.mover.moves[-1]["dist"], -(28.6 + 900.0 + 60.0))
 
     def test_a_stuck_tip_stops_before_the_long_pull(self):
         self.setUp({"path_mm": 900})
         self.slider(0, 1, 0)
-        self.release_on_retract()
-        # the free test compresses the slider: something still holds the tip
-        self.mover.on_move = lambda dist: dist > 0 and self.slider(0, 0, 0)
+        self.held_unload()
+
+        def on_move(dist):
+            if dist == 22.0:
+                self.slider(0, 0, 0)  # the free test compresses the slider
+            elif dist < 0:
+                self.slider(1, 0, 0)
+
+        self.mover.on_move = on_move
         with self.assertRaises(CommandError) as ctx:
             self.cmds["BUFFER_UNLOAD"](FakeGcmd())
         self.assertIn("not free", str(ctx.exception))
-        self.assertEqual([m["dist"] for m in self.mover.moves], [22.0])
+        self.assertEqual(self.mover.moves[-1]["dist"], 22.0, "nothing after the free test")
         self.assertIsNone(self.buf.nozzle_mm, "a failed unload must not store a length")
         self.assertFalse(self.buf.synced)
 
-    def test_no_release_means_no_pull(self):
-        self.slider(0, 1, 0)
-        with self.assertRaises(CommandError) as ctx:
-            self.cmds["BUFFER_UNLOAD"](FakeGcmd())
-        self.assertIn("never let go", str(ctx.exception))
-        self.assertEqual(self.mover.moves, [])
-        self.assertFalse(self.buf.synced)
-        self.assertFalse(self.buf.ctrl.reverse)
-
-    def test_a_relaxed_slider_finds_the_tip_first(self):
+    def test_a_relaxed_slider_makes_contact_first(self):
         self.setUp({"path_mm": 900})
-        self.slider(1, 0, 0)  # at rest: is anything holding the far end?
-        self.mover.results = [(28.6, True)]
-        self.release_on_retract()
+        self.slider(1, 0, 0)  # at rest: feed until something holds the far end
+        self.mover.results = [(28.6, True), (-26.6, False), (22.0, False), (88.6, True)]
         self.cmds["BUFFER_UNLOAD"](FakeGcmd())
-        find = self.mover.moves[0]
-        self.assertEqual(find["endstop"], "pos2")
-        self.assertGreater(find["dist"], 0.0)
+        first = self.mover.moves[0]
+        self.assertEqual(first["endstop"], "pos2")
+        self.assertGreater(first["dist"], 0.0)
 
-    def test_without_a_path_length_it_stops_once_free(self):
+    def test_without_a_path_length_it_stops_clear_of_the_gears(self):
         self.slider(0, 1, 0)
-        self.release_on_retract()
+        self.held_unload()
         gcmd = FakeGcmd()
         self.cmds["BUFFER_UNLOAD"](gcmd)
-        self.assertEqual([m["dist"] for m in self.mover.moves], [22.0])
+        self.assertAlmostEqual(self.mover.moves[-1]["dist"], -(28.6 + 100.0))
         self.assertIn("PATH=", gcmd.responses[-1])
 
     def test_unload_refusals(self):

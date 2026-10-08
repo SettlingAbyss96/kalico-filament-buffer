@@ -200,26 +200,32 @@ grab the tip, then the gears-to-nozzle length plus a 15 mm margin, then the purg
 only purges a bit more, so the margin is cheap. Every 10 mm it checks the slider, and if it sits
 at pos3 the extruder isn't taking the filament and the load stops.
 
-**Unloading** (`BUFFER_UNLOAD`) is loading run backwards, and every step ends on a sensor event,
-not a distance:
+**Unloading** (`BUFFER_UNLOAD`) is loading run backwards, with one thing loading never has to
+worry about: the tip comes out of the gears soft. Push on it at that moment and the still-turning
+gears mash it into a blob that won't fit back up the tube. A slider held at pos2 does exactly that,
+because its spring presses the filament toward the extruder the whole time. So the slider stays
+relaxed, and every distance comes from a sensor event:
 
-1. **Find the tip.** A slider held out of pos1 means the far end is held, so the filament is in the
-   extruder. At rest, the buffer feeds until pos2, which puts the tip at the gears
-2. **Retract, synced, in reverse.** A small push first so the tip leaves from fresh melt, then one
-   continuous retraction: 25 mm at 35 mm/s out of the hot zone, then 20 mm/s. No stops while the tip
-   is in the heatbreak, which is how a soft tip swells and jams. The zone multipliers are mirrored
-   around 1 for this ([CONTROL.md, section 11](CONTROL.md#11-unloading-running-it-backwards))
-3. **The release.** When the tip leaves the gears the extruder stops taking filament up and the
-   slider falls to pos1. That edge marks the release and measures the gears-to-nozzle length. The
-   buffer then pulls the tip clear (49 mm) and holds, while the extruder finishes its retraction
+1. **Contact.** Feed until the slider reaches the lower edge of pos2, against the extruder or a
+   tip resting on the gears. Now the slack it holds is known
+2. **Relax.** Take all but 2 mm of that slack back, so the spring presses on nothing
+3. **Retract, synced, at a fixed 1.02.** No zone control: the buffer runs a hair faster than the
+   extruder, so the slider stays relaxed and the filament is never pushed. While the extruder holds
+   the filament it sets the pace. Once the tip is out of the gears the buffer is already pulling it
+   up and away. A small push first so the tip leaves from fresh melt, then one continuous
+   retraction, 25 mm at 35 mm/s out of the hot zone, then 20 mm/s, to the gears-to-nozzle length
+   plus 45 mm
 4. **The free test.** The buffer feeds 22 mm. A free tip just slides, so the slider stays in pos1.
-   A tip stuck above the gears (a swollen one that won't enter the PTFE, say) compresses it past the
-   top of pos1. Stuck means stop, with nothing pulled further
-5. **Pull back** the measured path minus a 50 mm park, so the tip stays in the buffer gear ready to
-   reload, or past the gear with `EJECT=1`
+   A tip that didn't make it past the gears compresses it past the top of pos1. Stuck means stop,
+   with nothing pulled further
+5. **Contact again.** The feed it takes says where the tip was. That's the park position without
+   any estimate, and, since the buffer carried the tip 1.02 times the overrun past the gears, it
+   also gives the gears-to-nozzle length
+6. **Pull back** the slack plus the measured path minus a 50 mm park, so the tip stays in the
+   buffer gear ready to reload, or past the gear with `EJECT=1`
 
-The extruder may retract more than it needs to. That costs nothing: once the tip is gone its gears
-just spin, and the buffer is holding by then.
+If the tip does stick above the gears, the buffer slips for the overrun at most, about 45 mm once
+the gears-to-nozzle length is known (more the first time, while it's still a guess).
 
 **Motor power.** The buffer motor is switched off whenever it is idle and unsynced, and Kalico
 switches it back on at its next step. Held at the full 0.49 A with nothing moving, the motor got
@@ -252,8 +258,8 @@ printed for the config, with the gap and band widths.
 
 | Layer | What it proves |
 |---|---|
-| `tests/test_controller.py` (31 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs. Unloading: forward multipliers on a long retraction pull against the extruder, mirrored ones never do, the release is seen within a few mm, the buffer pulls clear and holds |
-| `tests/test_adapter.py` (34 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, no release meaning no pull; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
+| `tests/test_controller.py` (31 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs. Unloading: forward multipliers on a long retraction pull against the extruder, holding pos2 leaves the spring pressing on the tip at the release, a relaxed follow never pushes and carries the tip away by the expected length |
+| `tests/test_adapter.py` (33 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, contact first from a relaxed slider; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
 | `config/buffer-test.cfg` | Hardware: sensors, TMC link, LEDs, sync, motor direction |
 | `BUFFER_TEST_EXTRUDE` | Synced extrusion into the air at several speeds with 1 mm retractions. Checks the buffer every 25 mm and aborts safely when filament isn't consumed, isn't fed, or runs out |
 | Planned | A full test print with the buffer active: `print_stall` stays 0 and print time matches a run without it |
@@ -267,7 +273,7 @@ printed for the config, with the gap and band widths.
 | C1 | Path length, inlet to extruder gears | Done: measured by every autoload, kept with `SAVE_VARIABLE` |
 | C2 | Extruder grab point | with the tip at the gears, step the extruder until the slider responds; repeat back and forth |
 | C3 | Slider position between sensors | from the measured geometry, to remove the one-off excursions when a very different filament is first loaded |
-| C5 | Extruder gears to nozzle | Done: measured by every `BUFFER_UNLOAD` from the release. A pressure sensor at the nozzle could confirm it on the way in |
+| C5 | Extruder gears to nozzle | Done: measured by every `BUFFER_UNLOAD`, from how far the buffer carried the tip past the gears. A pressure sensor at the nozzle could confirm it on the way in |
 
 **Load temperatures** come from the printer's own filament settings, not a table in here. The
 plugin takes `TEMP=` and leaves the choice to the macro that calls it.

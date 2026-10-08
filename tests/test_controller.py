@@ -533,17 +533,21 @@ if __name__ == "__main__":
 
 class ReleaseSim(BufferSim):
     """Unloading: the extruder grips until it has retracted `grip` mm. After
-    that the far end is free, so the spring relaxes and the buffer's pull
-    moves the tip up the tube instead of the slider."""
+    that the far end is free, so whatever slack the slider still holds is
+    the spring pressing the soft tip back into the gears, and the buffer's
+    pull moves the tip up the tube instead of the slider."""
 
     def __init__(self, ctrl, grip, **kw):
         super().__init__(ctrl, **kw)
         self.grip = grip
         self.tip_up = 0.0
+        self.x_at_release = None
 
     def step(self, v):
         if self.E > -self.grip:
             return super().step(v)
+        if self.x_at_release is None:
+            self.x_at_release = self.x
         dE = v * self.dt
         self.E += dE
         self.t += self.dt
@@ -565,63 +569,63 @@ class ReleaseSim(BufferSim):
             self._note_rate()
 
 
-def synced_retract(x0, reverse, ratio_err=0.0, mm=120.0, speed=20.0):
+def unload_sim(x0, follow, grip=1e9, ratio_err=0.0):
     ctrl = new_ctrl()
-    sim = BufferSim(ctrl, x0=x0, ratio_err=ratio_err, faults=False)
-    if reverse:
-        ctrl.set_reverse(True, 0.0, clear_mm=49.0)
+    sim = ReleaseSim(ctrl, grip, x0=x0, ratio_err=ratio_err, faults=False)
+    ctrl.set_follow(follow)
+    # the plugin sets the rate before anything moves: no latency to model
+    sim.applied = sim.target = ctrl.effective()
+    return ctrl, sim
+
+
+def synced_retract(x0, follow=None, ratio_err=0.0, mm=120.0, speed=20.0):
+    ctrl, sim = unload_sim(x0, follow, ratio_err=ratio_err)
     xs = []
-    steps = int(mm / speed / 0.025)
-    for _ in range(steps):
+    for _ in range(int(mm / speed / 0.025)):
         sim.run(-speed, 0.025)
         xs.append(sim.x)
     return sim, min(xs), max(xs)
 
 
-class TestReverse(unittest.TestCase):
-    """Slack changes by (m - 1) * dE whichever way the extruder runs. Forward
-    multipliers on a retraction push the slider further the wrong way."""
-
-    def test_multipliers_mirror_around_one(self):
-        c = new_ctrl()
-        c.set_reverse(True, 0.0)
-        for zone, forward in ((ZONE_POS1, c.m_pos1), (ZONE_POS3, c.m_pos3), (ZONE_POS2, c.m_target)):
-            c.zone, c.approach = zone, False
-            self.assertAlmostEqual(c.multiplier(), 2.0 - forward)
+class TestUnload(unittest.TestCase):
+    """Slack changes by (m - 1) * dE whichever way the extruder runs."""
 
     def test_forward_logic_on_a_retraction_pulls_against_the_extruder(self):
-        # starting below pos2 (what happened on the printer on 2026-10-08)
+        # starting below pos2 the zone multipliers drive the slider the wrong way
         for x0, err in ((10.0, 0.0), (10.0, -0.03), (24.0, 0.03)):
-            sim, lo, hi = synced_retract(x0, reverse=False, ratio_err=err)
+            sim, lo, hi = synced_retract(x0, follow=None, ratio_err=err)
             self.assertGreater(sim.tug_total, 25.0, (x0, err))
 
-    def test_reverse_mode_holds_the_slider_and_never_tugs(self):
-        for x0, err in ((10.0, 0.0), (10.0, -0.03), (24.0, 0.03), (31.0, 0.0), (31.0, 0.03)):
-            sim, lo, hi = synced_retract(x0, reverse=True, ratio_err=err)
-            self.assertEqual(sim.tug_total, 0.0, (x0, err))
-            self.assertEqual(sim.ground_mm, 0.0, (x0, err))
-            self.assertLess(abs(sim.x - 29.5), 3.0, "ends back near the lower edge of pos2")
-
-    def test_release_is_seen_then_the_buffer_pulls_clear_and_holds(self):
-        ctrl = new_ctrl()
-        sim = ReleaseSim(ctrl, grip=65.0, x0=29.5, faults=False)
-        ctrl.set_reverse(True, 0.0, clear_mm=49.0)
+    def test_holding_pos2_presses_the_tip_into_the_gears(self):
+        # zone control from pos2: the spring is still compressed at the release
+        ctrl, sim = unload_sim(29.5, None, grip=65.0)
         sim.run(-35.0, 25.0 / 35.0)
-        sim.run(-20.0, 105.0 / 20.0)
-        self.assertIsNotNone(ctrl.release_e)
-        # seen once the slider has fallen from pos2 to the top of pos1
-        self.assertAlmostEqual(-ctrl.release_e - 9.6, 65.0, delta=3.0)
-        # clear_mm takes up the 19 mm left in pos1, then moves the tip
-        self.assertAlmostEqual(sim.tip_up, 49.0 - 19.0, delta=8.0)
-        self.assertLess(ctrl.multiplier(), 0.01, "holds once clear")
+        sim.run(-20.0, 120.0 / 20.0)
+        self.assertGreater(sim.x_at_release, 15.0)
 
-    def test_starting_at_rest_is_not_a_release_and_nothing_is_learned(self):
-        ctrl = new_ctrl()
-        sim = BufferSim(ctrl, x0=5.0, ratio_err=0.04, faults=False)
-        ctrl.set_reverse(True, 0.0, clear_mm=49.0)
+    def test_a_relaxed_follow_never_pushes(self):
+        for err in (-0.03, 0.0, 0.03):
+            ctrl, sim = unload_sim(2.0, 1.02, grip=65.0, ratio_err=err)
+            sim.run(-35.0, 25.0 / 35.0)
+            sim.run(-20.0, 120.0 / 20.0)
+            self.assertLess(sim.x_at_release, 3.0, err)
+            self.assertEqual(sim.ground_mm, 0.0)
+            # a slight pull while gripped, a few percent of the travel at most
+            self.assertLess(sim.tug_total, 0.06 * 65.0 + 1.0, err)
+
+    def test_after_the_release_the_buffer_carries_the_tip_away(self):
+        ctrl, sim = unload_sim(2.0, 1.02, grip=65.0)
+        sim.run(-35.0, 25.0 / 35.0)
+        sim.run(-20.0, 120.0 / 20.0)
+        self.assertAlmostEqual(sim.tip_up, 1.02 * (145.0 - 65.0), delta=3.0)
+        # which is how BUFFER_UNLOAD gets the gears-to-nozzle length back
+        self.assertAlmostEqual(145.0 - sim.tip_up / 1.02, 65.0, delta=3.0)
+
+    def test_nothing_is_learned_at_a_fixed_multiplier(self):
+        ctrl, sim = unload_sim(5.0, 1.02, ratio_err=0.04)
         trim = ctrl.trim
-        self.assertIsNone(ctrl.release_e)
         for _ in range(200):
             sim.run(-20.0, 0.025)
-        self.assertEqual(ctrl.trim, trim)
-        self.assertEqual(ctrl.trim_updates, 0)
+        self.assertEqual((ctrl.trim, ctrl.trim_updates), (trim, 0))
+        ctrl.set_follow(None)
+        self.assertNotEqual(ctrl.multiplier(), 1.02)

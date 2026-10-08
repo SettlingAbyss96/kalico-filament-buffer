@@ -7,9 +7,9 @@ that **assists the extruder** (less load and less heat at the extruder gears). I
 only for a real runout, tangle or jam.
 
 **Status:** feed control, fault pausing, loading on insert, calibration and the test tooling are
-running on a Voron 2.4. Unloading (synced, in reverse, with a free test before the long pull),
-loading to the nozzle and measured path lengths are new and still owe their first run on the
-printer. A runout deadline and same-spool continuation are next; see
+running on a Voron 2.4, and so are loading to the nozzle and the measured path lengths. Unloading
+(synced with the slider relaxed, a free test before the long pull) is new and still owes its first
+full run on the printer. A runout deadline and same-spool continuation are next; see
 [docs/DESIGN.md](docs/DESIGN.md#planned).
 
 ## Hard rules
@@ -119,9 +119,10 @@ The derivations, assumptions and where every default comes from are in
   buffer MCU, so the motor stops the moment a sensor trips. Press either buffer button to cancel.
   `BUFFER_LOAD` does the same on demand, and `BUFFER_LOAD TO=nozzle TEMP=` carries on through
   the hotend and purges. A load from an empty path measures the path on the way.
-- **Unloading:** `BUFFER_UNLOAD TEMP=` retracts with the buffer synced in reverse, watches the
-  slider for the moment the extruder lets go (which measures the gears-to-nozzle length), checks the
-  tip is really free, then pulls it back to the buffer. `EJECT=1` pulls it out past the buffer gear.
+- **Unloading:** `BUFFER_UNLOAD TEMP=` relaxes the slider, retracts with the buffer following a
+  hair faster than the extruder so nothing presses the soft tip into the gears, checks the tip is
+  really free, then pulls it back to the buffer and measures the gears-to-nozzle length on the way.
+  `EJECT=1` pulls it out past the buffer gear.
   The whole sequence is in [docs/DESIGN.md](docs/DESIGN.md#loading-buttons-and-calibration).
 - **Buttons:** hold FEED or RETRACT to move the buffer for as long as you hold it. FEED stops by
   itself at pos3, so it can't push the tube out of its fitting.
@@ -199,7 +200,7 @@ managed_services: klipper
 | `BUFFER_STATS [RESET=1]` | extrusion share per zone, zone entries, rate changes, trim learning since reset |
 | `BUFFER_SYNC` / `BUFFER_UNSYNC` | sync the buffer to the extruder / release it. during a print both need the toolhead stopped: SYNC after an M400 in PRINT_START, UNSYNC after an M400 in PRINT_END |
 | `BUFFER_LOAD [SPEED=] [MAX=] [TO=nozzle] [PURGE=30] [TEMP=]` | feed from the inlet until the slider reaches pos2 (also runs by itself when filament is inserted). `TO=nozzle` continues through the hotend and purges; park the nozzle over a purge spot first |
-| `BUFFER_UNLOAD [TEMP=] [EJECT=1] [PARK=50] [MAX=] [PATH=]` | retract out of the hotend and extruder synced in reverse, test that the tip is free, pull it back to the buffer (or past the gear with `EJECT=1`). Stops with a clear message if the extruder never lets go or the tip is stuck |
+| `BUFFER_UNLOAD [TEMP=] [EJECT=1] [PARK=50] [MAX=] [PATH=]` | retract out of the hotend and extruder with the slider relaxed, test that the tip is free, pull it back to the buffer (or past the gear with `EJECT=1`). Stops with a clear message if the tip is stuck |
 | `BUFFER_CALIBRATE [RUNS=3] [TEMP=]` | measure and apply the buffer's true `rotation_distance` |
 | `BUFFER_MOVE DIST= [SPEED=]` | move the buffer on its own; feeding stops early at pos3 |
 | `BUFFER_SET ...` | runtime tuning (multipliers, fault distances, trim, `BAND_MM`, `REPORT_EVENTS=0/1`, `ROTATION_DISTANCE`) |
@@ -240,7 +241,7 @@ While printing, only `BUFFER_STATUS`, `BUFFER_STATS`, `BUFFER_SET` tuning, and `
 | `pos1_slack_mm`, `pos2_slack_mm` | 19, 28.6 | slack the slider holds at the top of pos1 and the lower edge of pos2 (LLL Plus) |
 | `path_mm`, `nozzle_mm` | measured | inlet to extruder gears, gears to nozzle. Measured by autoload and `BUFFER_UNLOAD` and kept with `SAVE_VARIABLE` when `[save_variables]` exists; set them here to override |
 | `unload_fast_mm`, `unload_fast_speed`, `unload_speed`, `unload_ram_mm` | 25, 35 mm/s, 20 mm/s, 3 | the unload retraction: fast out of the hot zone, then steady, after a small push |
-| `unload_test_mm`, `unload_clear_mm` | 22, 49 | the free test feed and the pull after the release ([CONTROL.md, section 11](docs/CONTROL.md#11-unloading-running-it-backwards)) |
+| `unload_test_mm`, `unload_overrun_mm` | 22, 45 | the free test feed, and how far the extruder retracts past the gears-to-nozzle length ([CONTROL.md, section 11](docs/CONTROL.md#11-unloading-running-it-backwards)) |
 | `park_mm`, `eject_margin_mm` | 50, 60 | where an unload leaves the tip, and how far past the path an eject pulls |
 
 Defaults are the values the offline simulation suite validates. A test checks that the config defaults
@@ -248,13 +249,14 @@ can't drift from them.
 
 ## Testing
 
-- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 65 tests:
+- **Offline** (no printer): `python3 -m unittest discover -s tests -v`. There are 64 tests:
   - A physical model of the slider, with the sensor geometry measured on a real LLL Plus, drives
     the real controller: retractions up to 1 mm, flow up to 15 mm/s, ratio errors ±4%, sensor
     noise, slow rate application, other sensor geometries and layouts, mid-print filament changes,
     a slipping gear, a clog, and long soak runs.
   - The same model runs long synced retractions: the forward multipliers pull against the
-    extruder, the mirrored ones never do, and the release shows up where it should.
+    extruder, holding pos2 leaves the spring pressing on the tip as it leaves the gears, and a
+    relaxed follow never pushes.
   - Adapter tests check the hard rule, loading, unloading, the motor switching off, the measured
     lengths, buttons and calibration math against stand-in Kalico objects.
 - **Hardware:** `config/buffer-test.cfg` (`BUFFER_TEST_HELP` lists the steps), ending with
@@ -342,13 +344,14 @@ Because the feedback only corrects a residual of a few percent, it can stay gent
 signal is a small multiplier applied to a motion that is already right, so the printer's motion
 is never interrupted by it.
 
-**Why does unloading mirror the multipliers?**
+**Why does unloading keep the slider relaxed?**
 
-Because slack changes by $`(g\,m - 1)\,dE`$ whichever way the extruder runs. The multipliers were
-chosen for $`dE > 0`$, and with $`dE < 0`$ every correction points the wrong way: the slider runs
-off to an end and the buffer pulls against the extruder's grip. Mirroring each one around 1
-($`m' = 2 - m`$) keeps the sign. Unloading is then just loading run backwards, with the release of
-the extruder as the event that ends it ([CONTROL.md, section 11](docs/CONTROL.md#11-unloading-running-it-backwards)).
+Because the tip comes out of the gears soft, and a compressed slider presses it straight back in.
+The zone control would hold the slider at pos2 (and run the wrong way backwards anyway, since slack
+changes by $`(g\,m - 1)\,dE`$ whichever way the extruder turns). On the printer that mashed the tip
+into a blob the tube wouldn't take, four times in a row. So the slack comes out first and the buffer
+just follows a hair faster than the extruder: it never pushes, and the moment the tip is free it
+pulls it away ([CONTROL.md, section 11](docs/CONTROL.md#11-unloading-running-it-backwards)).
 
 **Why prove the tip is free before pulling it back?**
 

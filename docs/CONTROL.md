@@ -294,56 +294,55 @@ dx = (g\,m - 1)\,dE
 
 The zone multipliers were picked for $`dE > 0`$. In pos1 the slider needs slack, so $`m_1 > 1`$
 makes $`dx`$ positive. Flip the sign of $`dE`$ and the same $`m_1`$ makes $`dx`$ negative: the
-correction now drives the slider further the wrong way. A print retraction is too short for that to
+correction drives the slider further the wrong way. A print retraction is too short for that to
 matter (section 6). An unload is not. In the simulation, a 120 mm synced retraction that starts
 below pos2 with the forward multipliers pulls 30 to 50 mm of filament against the extruder's grip,
 which is grinding, plain and simple.
 
-The fix keeps the correction's sign by mirroring each multiplier around 1 while unloading:
+Mirroring the multipliers around 1 would fix the sign, and it's still the wrong idea, because it
+holds the slider at pos2. The spring then presses the filament toward the extruder with all of
+$`x_2`$ compressed, and at the moment the tip comes out of the gears that force lands on the soft
+tip, against gears that are still turning. On the printer that left a mashed, swollen tip that
+wouldn't go back up the tube, four times in a row.
+
+So the unload doesn't control the slider at all. It takes the slack out first, leaving
+$`x_0 = 2`$ mm, then runs the buffer at a fixed $`m = f = 1.02`$:
 
 ```math
-m'(z) = \max\big(0.05,\ 2 - m(z)\big) \quad\Longrightarrow\quad dx = \big(g\,m' - 1\big)\,dE \approx \big(m(z) - 1\big)\,|dE|
+dx = (g\,f - 1)\,dE < 0 \quad\text{for } dE < 0,\ g\,f > 1
 ```
 
-So pos1 gets $`m_1' = 0.5`$ (the buffer retracts half as fast and the slider gains slack), pos3 gets
-$`m_3' = 1.7`$, and pos2 gets $`1.01`$. The same simulation then never pulls against the extruder,
-from any start position and with ratio errors of $`\pm 3\%`$, and the slider settles back at the
-lower edge of pos2. The trim learns nothing in reverse: its update rules assume forward extrusion.
+so the slider can only lose slack. It sits at the rest end, and the extruder sets the pace while it
+holds the filament (the buffer slips by $`(g f - 1)`$, a few percent, which the simulation keeps
+under 5 mm over 65 mm with $`\pm 3\%`$ ratio errors). At the release there is nothing compressed to
+push the tip back, and the buffer is already pulling.
 
-**The release.** While the extruder holds the filament, the mirrored control keeps the slider near
-$`x_2`$. Once the tip leaves the gears, the extruder takes nothing up and the buffer's pull comes
-straight out of the slider, so $`x`$ falls to $`x_1`$ within about $`x_2 - x_1 = 9.6`$ mm of
-extruder travel. That pos1 edge is the release. The gears-to-nozzle length follows from where it
-happened:
+**The gears-to-nozzle length.** With a total retraction $`E_{max}`$ and the release at $`L_n`$,
+the buffer carries the tip $`f\,(E_{max} - L_n)`$ past the gears. After the free test feeds $`t`$,
+feeding to contact takes $`F = f\,(E_{max} - L_n) - t + x_2`$, so
 
 ```math
-L_n \approx \big(E_{start} - E_{release}\big) - (x_2 - x_1)
+L_n = E_{max} - \frac{F - x_2 + t}{f}
 ```
 
-The simulation puts it within 3 mm of the true value.
+The simulation gets it back within 3 mm.
 
-**Pulling clear, then holding.** After the release the buffer runs 1:1 for `clear` mm of extruder
-travel, then drops to $`m = 0.001`$ and holds while the extruder finishes. The first $`x_1`$ of that
-comes out of the slider, so the tip ends up $`c - x_1`$ above the gears. With $`c = 49`$ that's
-about 30 mm. If the tip is stuck, the buffer slips for at most $`c - x_1`$ plus a little latency,
-not the whole retraction.
-
-**The free test.** Feeding $`f`$ mm with the far end free just slides the filament, and the slider
+**The free test.** Feeding $`t`$ mm with the far end free just slides the filament, and the slider
 stays relaxed. With the far end held, all of it lands in the slider. Choose
 
 ```math
-x_1 < f < c - x_1
+x_1 < t < f\,(E_{max} - L_n)
 ```
 
-so a held tip pushes the slider out of pos1 and a free one can't reach the gears. The defaults are
-$`f = x_1 + 3 = 22`$ and $`c = x_1 + f + 8 = 49`$, which leaves the free tip about 8 mm above the
-gears after the test.
+so a held tip pushes the slider out of pos1 and a free one can't reach the gears. With $`t = x_1 + 3 = 22`$
+and $`E_{max} = L_n + 45`$ that leaves a free tip about 24 mm above the gears after the test. If the
+tip is stuck, the buffer slips for the overrun, about 45 mm, and the test stops it there.
 
-**Where the tip ends up.** With the inlet-to-gears path $`L_p`$ measured by an autoload (the fed
-distance minus the $`x_2`$ of slack the slider holds at pos2), the final pull is
+**Where the tip ends up.** From contact the slider holds $`x_2`$, so with the inlet-to-gears path
+$`L_p`$ measured by an autoload (the fed distance minus $`x_2`$), the final pull is
 
 ```math
-\text{park: } L_p - (c - x_1 - f) - p, \qquad \text{eject: } L_p - (c - x_1 - f) + 60
+\text{park: } x_2 + L_p - p, \qquad \text{eject: } x_2 + L_p + 60
 ```
 
 with $`p = 50`$ mm. None of these lengths has to be exact. A 20 mm error in $`L_p`$ moves the

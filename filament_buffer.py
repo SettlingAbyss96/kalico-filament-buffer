@@ -30,11 +30,10 @@ NOZZLE_MARGIN_MM = 15.0  # extra feed past the nozzle estimate on a load
 MIN_NOZZLE_MM = 20.0  # a shorter release means the filament wasn't in the hotend
 MIN_PATH_MM = 100.0  # a shorter autoload isn't a full path measurement
 
-# Reverse (unload) mode: the zone multipliers are mirrored around 1 so the
-# slider correction keeps its sign when the extruder runs backwards. After the
-# extruder lets go of the filament the buffer pulls it clear, then holds.
-REVERSE_MIN = 0.05  # floor for a mirrored multiplier
-REVERSE_HOLD = 0.001  # after the clear pull: the buffer barely moves
+# Unloading runs the buffer at a fixed multiplier, not the zone control: the
+# slider stays relaxed so nothing presses the tip into the gears (DESIGN.md)
+UNLOAD_FOLLOW = 1.02  # a hair faster than the extruder: pulls, never pushes
+RELAX_LEAVE_MM = 2.0  # slack left in the slider before an unload
 
 ZONE_POS1 = "pos1"
 ZONE_BELOW = "below"
@@ -126,10 +125,8 @@ class FeedController:
         # hover-cycle bookkeeping for auto-trim: pos2 -> below/above -> pos2
         self.cycle_pos2_mm = None
         self.trim_updates = 0
-        # Reverse (unload) mode, see set_reverse()
-        self.reverse = False
-        self.release_e = None  # extruder position where the extruder let go
-        self.clear_mm = 0.0
+        # Fixed multiplier (unloading), see set_follow()
+        self.follow = None
         self.reset_stats(None)
 
     # --- statistics (BUFFER_STATS, BUFFER_TEST_EXTRUDE) --------------------
@@ -150,30 +147,18 @@ class FeedController:
             if val is not None:
                 setattr(self, key, val)
 
-    def set_reverse(self, reverse, e_pos, clear_mm=0.0):
-        """Unload mode. Slack in the slider changes by (m - 1) * dE whichever
-        way the extruder runs, so with dE < 0 the forward multipliers would
-        push the slider further the wrong way (positive feedback). Mirroring
-        m around 1 keeps the correction's sign. When the extruder lets go of
-        the filament the slider drops to pos1 while held: that edge is the
-        release. Then the buffer pulls clear_mm more at 1:1 and holds."""
-        self.reverse = bool(reverse)
-        self.release_e = None
-        self.clear_mm = clear_mm
-        self.zone = ZONE_UNKNOWN  # a fresh start can't count as a release
-        self.reset_zone(e_pos)
+    def set_follow(self, multiplier):
+        """A fixed multiplier instead of the zone control (None ends it).
+        Unloading uses it: slack changes by (m - 1) * dE whichever way the
+        extruder runs, so on a long retraction the forward multipliers drive
+        the slider further the wrong way, and holding it at pos2 would press
+        the tip into the gears the moment it comes out of them."""
+        self.follow = multiplier
 
     # --- state -----------------------------------------------------------
     def multiplier(self):
-        m = self._forward_multiplier()
-        if not self.reverse:
-            return m
-        if self.release_e is not None:
-            pulled = 0.0 if self.last_e is None else self.release_e - self.last_e
-            return 1.0 if pulled < self.clear_mm else REVERSE_HOLD
-        return max(REVERSE_MIN, 2.0 - m)
-
-    def _forward_multiplier(self):
+        if self.follow is not None:
+            return self.follow
         z = self.zone
         if z == ZONE_POS1:
             return self.m_pos1
@@ -231,17 +216,8 @@ class FeedController:
         prev_mm = None
         if self.zone_entry_e is not None and e_pos is not None:
             prev_mm = max(0.0, e_pos - self.zone_entry_e)
-        if self.reverse:
-            # The trim learning assumes forward extrusion: none in reverse.
-            # Dropping to pos1 from a held zone is the extruder letting go.
-            learn = False
-            if (
-                zone == ZONE_POS1
-                and prev not in (ZONE_POS1, ZONE_UNKNOWN)
-                and self.release_e is None
-                and e_pos is not None
-            ):
-                self.release_e = e_pos
+        if self.follow is not None:
+            learn = False  # the trim learning assumes zone control
         if learn:
             # Hard sensor hits: correct the belief, and the trim only when
             # the correct-side hover rate failed to hold the slider
@@ -439,8 +415,8 @@ class FeedController:
             self.zone_entry_e = e_pos
             return self.take_new_fault()
         net = e_pos - self.zone_entry_e
-        if self.reverse:
-            # no trim nudges or stall handling while unloading
+        if self.follow is not None:
+            # no trim nudges or stall handling at a fixed multiplier
             return self.take_new_fault()
         if self.zone == ZONE_POS2 and self.drift_up and net > self.up_stay_flip_mm:
             # Believed to drift up, yet it has stayed inside pos2 this long:
@@ -754,10 +730,11 @@ class FilamentBuffer:
         self.unload_test_mm = config.getfloat(
             "unload_test_mm", self.pos1_slack_mm + 3.0, above=self.pos1_slack_mm
         )
-        self.unload_clear_mm = config.getfloat(
-            "unload_clear_mm",
-            self.pos1_slack_mm + self.unload_test_mm + 8.0,
-            above=self.pos1_slack_mm + self.unload_test_mm,
+        # extruder retraction past the gears-to-nozzle length: room for the
+        # free test with a margin, and the most the buffer can slip if stuck
+        self.unload_overrun_mm = config.getfloat(
+            "unload_overrun_mm", self.unload_test_mm + 23.0,
+            above=self.unload_test_mm,
         )
         self.park_mm = config.getfloat("park_mm", 50.0, above=0.0)
         self.eject_margin_mm = config.getfloat("eject_margin_mm", 60.0, above=0.0)
@@ -1039,19 +1016,17 @@ class FilamentBuffer:
         self._reset_rate()
         self.es.sync_to_extruder(self.extruder_name if sync else "")
         self.synced = sync
+        self.ctrl.set_follow(None)
         if sync:
             e_pos = self._extruder_pos(self.reactor.monotonic())
-            self.ctrl.set_reverse(False, e_pos)
+            self.ctrl.reset_zone(e_pos)
             self._apply_rate(self.reactor.monotonic(), force=True)
-        else:
-            self.ctrl.reverse = False
 
-    def _set_reverse(self, reverse, clear_mm=0.0):
-        """Switch a synced buffer into or out of unload mode. Only the
-        controller state and the step distance change: no flush."""
-        now = self.reactor.monotonic()
-        self.ctrl.set_reverse(reverse, self._extruder_pos(now), clear_mm)
-        self._apply_rate(now, force=True)
+    def _set_follow(self, multiplier):
+        """Fixed multiplier on a synced buffer. Only the controller state and
+        the step distance change: no flush."""
+        self.ctrl.set_follow(multiplier)
+        self._apply_rate(self.reactor.monotonic(), force=True)
 
     # --- events (reactor context: never raise) ---------------------------
     def _pin_event(self, key, eventtime, state):
@@ -1470,21 +1445,18 @@ class FilamentBuffer:
     # --- unloading -------------------------------------------------------
     cmd_BUFFER_UNLOAD_help = (
         "Unload: retract the filament out of the hotend and extruder with the"
-        " buffer synced in reverse, prove the tip is free, then pull it back to"
-        " the buffer. Hotend hot or TEMP=. EJECT=1 pulls it out past the buffer"
-        " gear. [MAX=] [CLEAR=] [TEST=] [PARK=] [PATH=]. Not while printing."
+        " slider relaxed, so nothing presses the tip into the gears, prove the"
+        " tip is free, then pull it back to the buffer. Hotend hot or TEMP=."
+        " EJECT=1 pulls it out past the buffer gear. [MAX=] [TEST=] [PARK=]"
+        " [PATH=]. Not while printing."
     )
 
     def cmd_BUFFER_UNLOAD(self, gcmd):
         self._require_not_printing(gcmd, "BUFFER_UNLOAD")
         eject = bool(gcmd.get_int("EJECT", 0, minval=0, maxval=1))
         test = gcmd.get_float("TEST", self.unload_test_mm, above=self.pos1_slack_mm)
-        clear = gcmd.get_float(
-            "CLEAR", max(self.unload_clear_mm, self.pos1_slack_mm + test + 8.0),
-            above=self.pos1_slack_mm + test,
-        )
         max_mm = gcmd.get_float(
-            "MAX", 2.0 * (self.nozzle_mm or DEFAULT_NOZZLE_MM),
+            "MAX", (self.nozzle_mm or DEFAULT_NOZZLE_MM) + self.unload_overrun_mm,
             above=self.unload_fast_mm, maxval=500.0,
         )
         park = gcmd.get_float("PARK", self.park_mm, above=0.0)
@@ -1498,29 +1470,40 @@ class FilamentBuffer:
         self._heat_for(gcmd, "BUFFER_UNLOAD")
         self.unloading = self.keep_motor = True
         try:
-            self._find_tip(gcmd, path)
-            nozzle = self._unload_extruder(gcmd, max_mm, clear)
+            # 1. Contact: the slider at the lower edge of pos2, a known slack
+            self._contact(gcmd, path)
+            # 2. Relax: nothing may press on the filament at the gears
+            self._idle_move(-(self.pos2_slack_mm - RELAX_LEAVE_MM), self.load_grab_speed)
+            # 3. Retract with the buffer following, a hair faster
+            self._retract_relaxed(max_mm)
+            # 4. The free test
             self._free_test(gcmd, test)
-            if nozzle >= MIN_NOZZLE_MM:
+            # 5. Contact again. The feed it takes says where the tip was, so
+            # the park needs no estimate, and how far the buffer carried the
+            # tip past the gears gives the gears-to-nozzle length
+            fed = self._contact(gcmd, path)
+            above = fed - self.pos2_slack_mm + test
+            nozzle = max_mm - above / UNLOAD_FOLLOW
+            if MIN_NOZZLE_MM <= nozzle <= max_mm - 5.0:
                 gcmd.respond_info(
                     "buffer: extruder gears to nozzle is about %.0f mm" % nozzle
                 )
                 self._remember(gcmd, "nozzle", nozzle)
-            # the clear pull first takes up the slack the slider still held at
-            # the release (the top of pos1), then moves the tip; the free test
-            # fed some of it back
-            above = clear - self.pos1_slack_mm - test
+            elif nozzle < MIN_NOZZLE_MM:
+                gcmd.respond_info("buffer: the filament wasn't through the hotend")
+            # 6. Pull back from contact: the slack first, then the tip
             if path is None:
+                self._idle_move(-(self.pos2_slack_mm + 100.0), self.load_speed)
                 gcmd.respond_info(
-                    "buffer: the tip is free, about %.0f mm above the extruder gears."
-                    " The path length isn't known yet (autoload measures it, or pass"
-                    " PATH=), so it was not pulled further" % above
+                    "buffer: the tip is free and about 100 mm above the extruder"
+                    " gears. The path length isn't known yet (autoload measures it,"
+                    " or pass PATH=), so it was not pulled further"
                 )
                 return
             if eject:
-                pull = path - above + self.eject_margin_mm
+                pull = self.pos2_slack_mm + path + self.eject_margin_mm
             else:
-                pull = max(0.0, path - above - park)
+                pull = self.pos2_slack_mm + path - park
             self._idle_move(-min(pull, JOG_MAX_MM), self.load_speed)
             gcmd.respond_info(
                 "buffer: unloaded, %s"
@@ -1534,61 +1517,59 @@ class FilamentBuffer:
             self.unloading = self.keep_motor = False
             self._motor_off()
 
-    def _find_tip(self, gcmd, path):
-        """A slider held out of pos1 means the far end is held: the filament
-        is in the extruder. At rest, feed until it compresses to pos2, which
-        puts the tip at the gears; a free tip just slides until it gets there."""
-        if not self.pin_states.get("pos1"):
-            return
+    def _contact(self, gcmd, path):
+        """Bring the slider to the lower edge of pos2 against whatever holds the
+        far end (the extruder, or a tip resting on the gears), so the slack it
+        holds is known. Returns the filament fed to get there."""
+        fed = 0.0
+        if self.pin_states.get("pos2") or self.pin_states.get("pos3"):
+            # past the edge: ease back until pos2 clears, then come up to it
+            moved, _ = self._idle_move(
+                -15.0, 5.0, abort=lambda: not self.pin_states.get("pos2")
+            )
+            fed += moved
+            self._settle()
         moved, hit = self._idle_move(
             self.pos2_slack_mm + 20.0, self.load_grab_speed, endstop_key="pos2"
         )
+        fed += moved
         if not hit:
             limit = (path + 50.0) if path else self.load_max_mm
             more, hit = self._idle_move(
-                max(0.0, limit - moved), self.load_speed, endstop_key="pos2"
+                max(0.0, limit - fed), self.load_speed, endstop_key="pos2"
             )
-            moved += more
+            fed += more
         if not hit:
             raise gcmd.error(
                 "BUFFER_UNLOAD: fed %.0f mm and the slider never compressed, so the"
-                " filament never reached anything. Is it in the buffer gear?" % moved
+                " filament never reached anything. Is it in the buffer gear?" % fed
             )
+        return fed
 
-    def _unload_extruder(self, gcmd, max_mm, clear):
-        """Synced, in reverse: one continuous retraction, fast out of the hot
-        zone and then steady, so the tip never waits in the heatbreak. The
-        extruder letting go shows as the slider falling to pos1. Returns the
-        gears-to-nozzle estimate (meaningless if the free test then fails)."""
+    def _retract_relaxed(self, max_mm):
+        """Synced at a fixed multiplier a hair above 1, so the slider stays
+        relaxed. While the extruder holds the filament it sets the pace. Once
+        the tip is out of the gears the buffer carries it up and away instead
+        of a compressed spring pressing it back into gears that are still
+        turning. One continuous retraction, fast out of the hot zone, then
+        steady, so the soft tip never waits in the heatbreak."""
         run = self.gcode.run_script_from_command
         fast = min(self.unload_fast_mm, max_mm)
         run("SAVE_GCODE_STATE NAME=_buffer_unload\nM83\nM400")
         self._do_sync(True)
+        self._set_follow(UNLOAD_FOLLOW)
         try:
             if self.unload_ram_mm > 0.0:
                 # a little forward first, so the tip leaves from fresh melt
                 run("G1 E%.3f F300\nM400" % self.unload_ram_mm)
-            e_start = self._extruder_pos(self.reactor.monotonic())
-            self._set_reverse(True, clear)
             run(
                 "G1 E-%.3f F%.1f\nG1 E-%.3f F%.1f\nM400"
                 % (fast, self.unload_fast_speed * 60.0,
                    max_mm - fast, self.unload_speed * 60.0)
             )
-            self._settle()
-            release = self.ctrl.release_e
         finally:
             self._do_sync(False)
             run("RESTORE_GCODE_STATE NAME=_buffer_unload")
-        if release is None:
-            raise gcmd.error(
-                "BUFFER_UNLOAD: the extruder never let go of the filament in %.0f mm"
-                " of retraction. Stopped, nothing pulled. The tip may be caught below"
-                " the gears, or MAX= is too short" % max_mm
-            )
-        # the slider shows the release only after falling from pos2 to the top
-        # of pos1, which takes the slack between the two
-        return (e_start - release) - (self.pos2_slack_mm - self.pos1_slack_mm)
 
     def _free_test(self, gcmd, test):
         """A free tip slides forward without compressing the slider. One held
@@ -1599,9 +1580,9 @@ class FilamentBuffer:
         if hit or not self.pin_states.get("pos1"):
             raise gcmd.error(
                 "BUFFER_UNLOAD: the tip is not free. Feeding %.0f mm compressed the"
-                " slider, so something above the extruder gears still holds it"
-                " (often a swollen tip that won't enter the PTFE). Stopped before the"
-                " long pull: take it out at the toolhead" % test
+                " slider, so something still holds it: a tip that won't go up past"
+                " the gears, or a gears-to-nozzle length longer than MAX= allows."
+                " Stopped before the long pull" % test
             )
 
     # --- calibration -----------------------------------------------------
