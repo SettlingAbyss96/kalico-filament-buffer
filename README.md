@@ -359,9 +359,9 @@ the long pull only ever runs on filament that can move.
 
 **Why switch the motor off when idle?**
 
-It doesn't need holding torque between moves, and holding costs heat. At 0.49 A with nothing moving
-the motor warmed the closed buffer box until the board read about 57 °C. The stock firmware
-switched it off after every move as well.
+It doesn't need holding torque between moves, and holding costs heat. Held at 0.49 A with nothing
+moving, the motor got past 60 °C in the closed buffer box, and the board's sensor climbed about
+10 °C over its idle reading. The stock firmware switched it off after every move as well.
 
 ## Credits
 

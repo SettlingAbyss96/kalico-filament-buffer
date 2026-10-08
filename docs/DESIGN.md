@@ -222,10 +222,12 @@ The extruder may retract more than it needs to. That costs nothing: once the tip
 just spin, and the buffer is holding by then.
 
 **Motor power.** The buffer motor is switched off whenever it is idle and unsynced, and Kalico
-switches it back on at its next step. Held at the full 0.49 A it heated the closed buffer box to
-about 57 °C at the board with nothing moving. The stock firmware switched the motor off after
-every move too. While synced it stays on (it moves with every extrusion); a `hold_current` on the
-driver covers the standstills during a print.
+switches it back on at its next step. Held at the full 0.49 A with nothing moving, the motor got
+past 60 °C in the closed box, and the board's sensor climbed about 10 °C over its idle reading
+(the F072's sensor reads high, about 47 °C idle in a 24 °C room, so watch the change, not the
+number). The stock firmware switched the motor off after every move too. While synced it stays on,
+since it moves with every extrusion; a `hold_current` on the driver covers the stops during a
+print, and a lower `run_current` is the lever if a long print still warms it.
 
 **Buttons.** Holding FEED or RETRACT runs one continuous move that ends when the button is released.
 FEED also ends at pos3. That way, holding the button too long can't push the filament against a
