@@ -24,6 +24,17 @@ JOG_MAX_MM = 2000.0  # longest single independent move (buttons, BUFFER_MOVE)
 LOAD_INLET_GRACE = 0.3  # seconds the inlet may read empty before a load stops
 SENSOR_SETTLE = 0.15  # seconds for sensor reports to arrive after a move
 CALIBRATE_SPREAD = 0.04  # BUFFER_CALIBRATE: runs must agree within 4%
+# Loading and unloading work with margins, not exact distances (docs/DESIGN.md)
+DEFAULT_NOZZLE_MM = 100.0  # gears to nozzle until BUFFER_UNLOAD measures it
+NOZZLE_MARGIN_MM = 15.0  # extra feed past the nozzle estimate on a load
+MIN_NOZZLE_MM = 20.0  # a shorter release means the filament wasn't in the hotend
+MIN_PATH_MM = 100.0  # a shorter autoload isn't a full path measurement
+
+# Reverse (unload) mode: the zone multipliers are mirrored around 1 so the
+# slider correction keeps its sign when the extruder runs backwards. After the
+# extruder lets go of the filament the buffer pulls it clear, then holds.
+REVERSE_MIN = 0.05  # floor for a mirrored multiplier
+REVERSE_HOLD = 0.001  # after the clear pull: the buffer barely moves
 
 ZONE_POS1 = "pos1"
 ZONE_BELOW = "below"
@@ -115,6 +126,10 @@ class FeedController:
         # hover-cycle bookkeeping for auto-trim: pos2 -> below/above -> pos2
         self.cycle_pos2_mm = None
         self.trim_updates = 0
+        # Reverse (unload) mode, see set_reverse()
+        self.reverse = False
+        self.release_e = None  # extruder position where the extruder let go
+        self.clear_mm = 0.0
         self.reset_stats(None)
 
     # --- statistics (BUFFER_STATS, BUFFER_TEST_EXTRUDE) --------------------
@@ -135,8 +150,30 @@ class FeedController:
             if val is not None:
                 setattr(self, key, val)
 
+    def set_reverse(self, reverse, e_pos, clear_mm=0.0):
+        """Unload mode. Slack in the slider changes by (m - 1) * dE whichever
+        way the extruder runs, so with dE < 0 the forward multipliers would
+        push the slider further the wrong way (positive feedback). Mirroring
+        m around 1 keeps the correction's sign. When the extruder lets go of
+        the filament the slider drops to pos1 while held: that edge is the
+        release. Then the buffer pulls clear_mm more at 1:1 and holds."""
+        self.reverse = bool(reverse)
+        self.release_e = None
+        self.clear_mm = clear_mm
+        self.zone = ZONE_UNKNOWN  # a fresh start can't count as a release
+        self.reset_zone(e_pos)
+
     # --- state -----------------------------------------------------------
     def multiplier(self):
+        m = self._forward_multiplier()
+        if not self.reverse:
+            return m
+        if self.release_e is not None:
+            pulled = 0.0 if self.last_e is None else self.release_e - self.last_e
+            return 1.0 if pulled < self.clear_mm else REVERSE_HOLD
+        return max(REVERSE_MIN, 2.0 - m)
+
+    def _forward_multiplier(self):
         z = self.zone
         if z == ZONE_POS1:
             return self.m_pos1
@@ -194,6 +231,17 @@ class FeedController:
         prev_mm = None
         if self.zone_entry_e is not None and e_pos is not None:
             prev_mm = max(0.0, e_pos - self.zone_entry_e)
+        if self.reverse:
+            # The trim learning assumes forward extrusion: none in reverse.
+            # Dropping to pos1 from a held zone is the extruder letting go.
+            learn = False
+            if (
+                zone == ZONE_POS1
+                and prev not in (ZONE_POS1, ZONE_UNKNOWN)
+                and self.release_e is None
+                and e_pos is not None
+            ):
+                self.release_e = e_pos
         if learn:
             # Hard sensor hits: correct the belief, and the trim only when
             # the correct-side hover rate failed to hold the slider
@@ -391,6 +439,9 @@ class FeedController:
             self.zone_entry_e = e_pos
             return self.take_new_fault()
         net = e_pos - self.zone_entry_e
+        if self.reverse:
+            # no trim nudges or stall handling while unloading
+            return self.take_new_fault()
         if self.zone == ZONE_POS2 and self.drift_up and net > self.up_stay_flip_mm:
             # Believed to drift up, yet it has stayed inside pos2 this long:
             # any upward drift is negligible, so the trim has crossed over.
@@ -678,6 +729,38 @@ class FilamentBuffer:
         self.load_grab_speed = config.getfloat(
             "load_grab_speed", 10.0, above=0.0, maxval=self.max_move_speed
         )
+        # The motor only needs power while it moves. Held at full current it
+        # cooks itself in the closed buffer box (the stock firmware switched
+        # it off after every move)
+        self.idle_motor_off = config.getboolean("idle_motor_off", True)
+        # Slider geometry in filament mm of stored slack: the top of the pos1
+        # window and the lower edge of pos2 (LLL Plus: 19 and 28.6)
+        self.pos1_slack_mm = config.getfloat("pos1_slack_mm", 19.0, above=0.0)
+        self.pos2_slack_mm = config.getfloat(
+            "pos2_slack_mm", 28.6, above=self.pos1_slack_mm
+        )
+        # Path lengths. Measured by autoload (inlet to extruder gears) and
+        # BUFFER_UNLOAD (gears to nozzle), kept with SAVE_VARIABLE when
+        # [save_variables] exists. Set here to override
+        self.cfg_path_mm = config.getfloat("path_mm", None, above=0.0)
+        self.cfg_nozzle_mm = config.getfloat("nozzle_mm", None, above=0.0)
+        self.path_mm = self.cfg_path_mm
+        self.nozzle_mm = self.cfg_nozzle_mm
+        # Unloading (BUFFER_UNLOAD), all overridable per call
+        self.unload_fast_mm = config.getfloat("unload_fast_mm", 25.0, above=0.0)
+        self.unload_fast_speed = config.getfloat("unload_fast_speed", 35.0, above=0.0)
+        self.unload_speed = config.getfloat("unload_speed", 20.0, above=0.0)
+        self.unload_ram_mm = config.getfloat("unload_ram_mm", 3.0, minval=0.0)
+        self.unload_test_mm = config.getfloat(
+            "unload_test_mm", self.pos1_slack_mm + 3.0, above=self.pos1_slack_mm
+        )
+        self.unload_clear_mm = config.getfloat(
+            "unload_clear_mm",
+            self.pos1_slack_mm + self.unload_test_mm + 8.0,
+            above=self.pos1_slack_mm + self.unload_test_mm,
+        )
+        self.park_mm = config.getfloat("park_mm", 50.0, above=0.0)
+        self.eject_margin_mm = config.getfloat("eject_margin_mm", 60.0, above=0.0)
         layout = config.get("sensor_layout", "overlap")
         if layout not in ("overlap", "separate"):
             raise config.error("sensor_layout must be 'overlap' or 'separate'")
@@ -765,6 +848,9 @@ class FilamentBuffer:
         self.button_held = None
         self.button_loop_running = False
         self.loading = False
+        self.unloading = False
+        self.keep_motor = False  # sequences that need the motor held between moves
+        self.fresh_insert = False  # the next load starts with the tip at the inlet
         self.load_cancel = False
         self.inlet_clear_since = None
         self.last_load_mm = None
@@ -784,6 +870,7 @@ class FilamentBuffer:
             "BUFFER_UNSYNC",
             "BUFFER_MOVE",
             "BUFFER_LOAD",
+            "BUFFER_UNLOAD",
             "BUFFER_CALIBRATE",
             "BUFFER_SET",
             "BUFFER_TEST_EXTRUDE",
@@ -814,8 +901,59 @@ class FilamentBuffer:
         # extruder_stepper applies its configured sync on connect; read the
         # result here so config section order can't matter
         self.synced = bool(self.es.motion_queue)
+        self._load_saved()
         self._update_leds()
         self.reactor.update_timer(self.update_timer, self.reactor.NOW)
+
+    # --- measured distances ----------------------------------------------
+    def _load_saved(self):
+        sv = self.printer.lookup_object("save_variables", None)
+        if sv is None:
+            return
+        try:
+            saved = sv.get_status(self.reactor.monotonic()).get("variables", {})
+        except Exception:
+            logging.exception("filament_buffer: reading save_variables")
+            return
+        if self.cfg_path_mm is None and saved.get("buffer_path_mm"):
+            self.path_mm = float(saved["buffer_path_mm"])
+        if self.cfg_nozzle_mm is None and saved.get("buffer_nozzle_mm"):
+            self.nozzle_mm = float(saved["buffer_nozzle_mm"])
+
+    def _remember(self, gcmd, what, value):
+        """Keep a measured distance for this session, and across restarts
+        when [save_variables] exists (a config value always wins)."""
+        if what == "path":
+            if self.cfg_path_mm is not None:
+                return
+            self.path_mm = value
+        else:
+            if self.cfg_nozzle_mm is not None:
+                return
+            self.nozzle_mm = value
+        if self.printer.lookup_object("save_variables", None) is not None:
+            self.gcode.run_script_from_command(
+                "SAVE_VARIABLE VARIABLE=buffer_%s_mm VALUE=%.1f" % (what, value)
+            )
+        else:
+            gcmd.respond_info(
+                "buffer: add [save_variables] to keep the %s length across"
+                " restarts, or put %s_mm: %.0f in [filament_buffer]" % (what, what, value)
+            )
+
+    # --- motor power -----------------------------------------------------
+    def _motor_off(self):
+        """Switch the buffer motor off while it is idle. Kalico switches it
+        back on by itself at its next step (stepper_enable)."""
+        if not self.idle_motor_off or self.synced or self.keep_motor:
+            return
+        se = self.printer.lookup_object("stepper_enable", None)
+        if se is None or self.mcu_stepper is None:
+            return
+        try:
+            se.set_motors_enable([self.mcu_stepper.get_name()], False)
+        except Exception:
+            logging.exception("filament_buffer: switching the motor off")
 
     # --- helpers ---------------------------------------------------------
     def _print_state(self):
@@ -903,8 +1041,17 @@ class FilamentBuffer:
         self.synced = sync
         if sync:
             e_pos = self._extruder_pos(self.reactor.monotonic())
-            self.ctrl.reset_zone(e_pos)
+            self.ctrl.set_reverse(False, e_pos)
             self._apply_rate(self.reactor.monotonic(), force=True)
+        else:
+            self.ctrl.reverse = False
+
+    def _set_reverse(self, reverse, clear_mm=0.0):
+        """Switch a synced buffer into or out of unload mode. Only the
+        controller state and the step distance change: no flush."""
+        now = self.reactor.monotonic()
+        self.ctrl.set_reverse(reverse, self._extruder_pos(now), clear_mm)
+        self._apply_rate(now, force=True)
 
     # --- events (reactor context: never raise) ---------------------------
     def _pin_event(self, key, eventtime, state):
@@ -1058,6 +1205,8 @@ class FilamentBuffer:
             if self.synced or self.loading or self._print_state() in ("printing", "paused"):
                 return
             self._respond("filament detected, loading it to the extruder")
+            # the tip starts at the inlet, so this load measures the path
+            self.fresh_insert = True
             self.gcode.run_script("BUFFER_LOAD")
         except Exception as e:
             logging.exception("filament_buffer: autoload")
@@ -1092,6 +1241,8 @@ class FilamentBuffer:
         finally:
             if was_synced:
                 self._do_sync(True)
+            else:
+                self._motor_off()
 
     def _settle(self):
         """Let sensor reports from the end of a move arrive."""
@@ -1123,6 +1274,11 @@ class FilamentBuffer:
                 "ARMED" if c.faults_enabled else "off",
                 c.fault or "none",
             ),
+            "path inlet to gears %s | gears to nozzle %s"
+            % (
+                "%.0f mm" % self.path_mm if self.path_mm else "not measured",
+                "%.0f mm" % self.nozzle_mm if self.nozzle_mm else "not measured",
+            ),
         ]
         gcmd.respond_info("\n".join("buffer: " + l for l in lines))
 
@@ -1153,6 +1309,7 @@ class FilamentBuffer:
             # empty and unsyncing can't add a stop
             self._require_empty_queue(gcmd, "BUFFER_UNSYNC")
         self._do_sync(False)
+        self._motor_off()
         gcmd.respond_info("buffer: unsynced")
 
     cmd_BUFFER_MOVE_help = (
@@ -1178,23 +1335,42 @@ class FilamentBuffer:
 
     cmd_BUFFER_LOAD_help = (
         "Feed filament from the inlet until the slider reaches pos2, which puts"
-        " the tip against the extruder gears: [SPEED=] [MAX=]. A buffer button"
-        " cancels. Not while printing."
+        " the tip against the extruder gears: [SPEED=] [MAX=]. TO=nozzle then"
+        " feeds it through the hotend and purges: [PURGE=30] [TEMP=] (park the"
+        " nozzle over a purge spot first). A buffer button cancels. Not while"
+        " printing."
     )
 
     def cmd_BUFFER_LOAD(self, gcmd):
         self._require_not_printing(gcmd, "BUFFER_LOAD")
+        measure = self.fresh_insert or bool(gcmd.get_int("MEASURE", 0, minval=0, maxval=1))
+        self.fresh_insert = False
+        to = gcmd.get("TO", "gears").lower()
+        if to not in ("gears", "nozzle"):
+            raise gcmd.error("BUFFER_LOAD: TO must be gears or nozzle")
         if self.synced:
             raise gcmd.error("BUFFER_LOAD: the buffer is synced; BUFFER_UNSYNC first")
         if not self.pin_states.get("inlet"):
             raise gcmd.error("BUFFER_LOAD: no filament at the buffer inlet")
-        if self.pin_states.get("pos2") or self.pin_states.get("pos3"):
-            gcmd.respond_info("buffer: already loaded (the slider is at pos2)")
-            return
+        at_gears = self.pin_states.get("pos2") or self.pin_states.get("pos3")
+        if at_gears:
+            gcmd.respond_info("buffer: the tip is at the extruder gears (slider at pos2)")
+            if to == "gears":
+                return
+        self.keep_motor = True
+        try:
+            if (at_gears or self._load_to_gears(gcmd, measure)) and to == "nozzle":
+                self._load_to_nozzle(gcmd)
+        finally:
+            self.keep_motor = False
+            self._motor_off()
+
+    def _load_to_gears(self, gcmd, measure):
         speed = gcmd.get_float(
             "SPEED", self.load_speed, above=0.0, maxval=self.max_move_speed
         )
         max_mm = gcmd.get_float("MAX", self.load_max_mm, above=0.0, maxval=JOG_MAX_MM)
+        at_rest = self.pin_states.get("pos1")
         self.loading, self.load_cancel = True, False
         self.inlet_clear_since = None
         start = self.reactor.monotonic()
@@ -1218,9 +1394,19 @@ class FilamentBuffer:
                 "buffer: loaded, pos2 reached after %.0f mm (%.0f s). The tip is at"
                 " the extruder gears." % (moved, secs)
             )
-        elif self.load_cancel:
+            # From an empty path the slider starts relaxed, so everything fed
+            # beyond the slack it now holds is the path itself
+            path = moved - self.pos2_slack_mm
+            if measure and at_rest and path >= MIN_PATH_MM:
+                gcmd.respond_info(
+                    "buffer: path from the inlet to the extruder gears is about %.0f mm" % path
+                )
+                self._remember(gcmd, "path", path)
+            return True
+        if self.load_cancel:
             gcmd.respond_info("buffer: load cancelled after %.0f mm" % moved)
-        elif not self.pin_states.get("inlet"):
+            return False
+        if not self.pin_states.get("inlet"):
             raise gcmd.error(
                 "BUFFER_LOAD: stopped after %.0f mm, the filament left the inlet" % moved
             )
@@ -1229,6 +1415,193 @@ class FilamentBuffer:
                 "BUFFER_LOAD: pos2 not reached after %.0f mm. The buffer gear may not"
                 " have gripped the filament, or the path is longer than"
                 " load_max_mm." % moved
+            )
+
+    def _heat_for(self, gcmd, what):
+        temp = gcmd.get_float("TEMP", None, minval=0.0, maxval=400.0)
+        if temp is not None:
+            gcmd.respond_info("buffer: heating to %.0f C" % temp)
+            self.gcode.run_script_from_command("M109 S%.1f" % temp)
+        if not self.extruder.get_heater().can_extrude:
+            raise gcmd.error("%s: hotend too cold to extrude; heat it or pass TEMP=" % what)
+
+    def _extrude_checked(self, gcmd, total, speed, what):
+        """Synced extrusion in 10 mm pieces, stopping if the slider says the
+        extruder isn't taking the filament or the buffer can't keep up."""
+        run = self.gcode.run_script_from_command
+        done = 0.0
+        while done < total - 1e-6:
+            piece = min(10.0, total - done)
+            run("G1 E%.3f F%.1f\nM400" % (piece, speed * 60.0))
+            done += piece
+            problem = self._test_check()
+            if problem:
+                raise gcmd.error("%s: stopped after %.0f mm, %s" % (what, done, problem))
+
+    def _load_to_nozzle(self, gcmd):
+        """The tip is at the extruder gears. Grab it slowly, feed the
+        gears-to-nozzle length plus a margin, then purge. Feeding too far
+        only purges a little more; the margin covers the estimate."""
+        what = "BUFFER_LOAD TO=nozzle"
+        purge = gcmd.get_float("PURGE", 30.0, minval=0.0, maxval=300.0)
+        self._heat_for(gcmd, what)
+        nozzle = self.nozzle_mm or DEFAULT_NOZZLE_MM
+        if self.nozzle_mm is None:
+            gcmd.respond_info(
+                "buffer: gears-to-nozzle length not measured yet, assuming %.0f mm"
+                " (BUFFER_UNLOAD measures it)" % nozzle
+            )
+        run = self.gcode.run_script_from_command
+        run("SAVE_GCODE_STATE NAME=_buffer_load\nM83\nM400")
+        self._do_sync(True)
+        try:
+            self._extrude_checked(gcmd, 10.0, 2.0, what)
+            self._extrude_checked(gcmd, nozzle + NOZZLE_MARGIN_MM - 10.0, 5.0, what)
+            if purge > 0.0:
+                self._extrude_checked(gcmd, purge, 3.0, what)
+        finally:
+            self._do_sync(False)
+            run("RESTORE_GCODE_STATE NAME=_buffer_load")
+        gcmd.respond_info(
+            "buffer: loaded to the nozzle (%.0f mm through the hotend, %.0f mm purged)"
+            % (nozzle + NOZZLE_MARGIN_MM, purge)
+        )
+
+    # --- unloading -------------------------------------------------------
+    cmd_BUFFER_UNLOAD_help = (
+        "Unload: retract the filament out of the hotend and extruder with the"
+        " buffer synced in reverse, prove the tip is free, then pull it back to"
+        " the buffer. Hotend hot or TEMP=. EJECT=1 pulls it out past the buffer"
+        " gear. [MAX=] [CLEAR=] [TEST=] [PARK=] [PATH=]. Not while printing."
+    )
+
+    def cmd_BUFFER_UNLOAD(self, gcmd):
+        self._require_not_printing(gcmd, "BUFFER_UNLOAD")
+        eject = bool(gcmd.get_int("EJECT", 0, minval=0, maxval=1))
+        test = gcmd.get_float("TEST", self.unload_test_mm, above=self.pos1_slack_mm)
+        clear = gcmd.get_float(
+            "CLEAR", max(self.unload_clear_mm, self.pos1_slack_mm + test + 8.0),
+            above=self.pos1_slack_mm + test,
+        )
+        max_mm = gcmd.get_float(
+            "MAX", 2.0 * (self.nozzle_mm or DEFAULT_NOZZLE_MM),
+            above=self.unload_fast_mm, maxval=500.0,
+        )
+        park = gcmd.get_float("PARK", self.park_mm, above=0.0)
+        path = gcmd.get_float("PATH", self.path_mm, above=0.0)
+        if self.synced:
+            raise gcmd.error("BUFFER_UNLOAD: the buffer is synced; BUFFER_UNSYNC first")
+        if not self.pin_states.get("inlet"):
+            gcmd.respond_info(
+                "buffer: no filament at the inlet, unloading what is left in the path"
+            )
+        self._heat_for(gcmd, "BUFFER_UNLOAD")
+        self.unloading = self.keep_motor = True
+        try:
+            self._find_tip(gcmd, path)
+            nozzle = self._unload_extruder(gcmd, max_mm, clear)
+            self._free_test(gcmd, test)
+            if nozzle >= MIN_NOZZLE_MM:
+                gcmd.respond_info(
+                    "buffer: extruder gears to nozzle is about %.0f mm" % nozzle
+                )
+                self._remember(gcmd, "nozzle", nozzle)
+            # the clear pull first takes up the slack the slider still held at
+            # the release (the top of pos1), then moves the tip; the free test
+            # fed some of it back
+            above = clear - self.pos1_slack_mm - test
+            if path is None:
+                gcmd.respond_info(
+                    "buffer: the tip is free, about %.0f mm above the extruder gears."
+                    " The path length isn't known yet (autoload measures it, or pass"
+                    " PATH=), so it was not pulled further" % above
+                )
+                return
+            if eject:
+                pull = path - above + self.eject_margin_mm
+            else:
+                pull = max(0.0, path - above - park)
+            self._idle_move(-min(pull, JOG_MAX_MM), self.load_speed)
+            gcmd.respond_info(
+                "buffer: unloaded, %s"
+                % (
+                    "the tip is out past the buffer gear (wind the spool back)"
+                    if eject
+                    else "the tip is parked about %.0f mm past the buffer inlet" % park
+                )
+            )
+        finally:
+            self.unloading = self.keep_motor = False
+            self._motor_off()
+
+    def _find_tip(self, gcmd, path):
+        """A slider held out of pos1 means the far end is held: the filament
+        is in the extruder. At rest, feed until it compresses to pos2, which
+        puts the tip at the gears; a free tip just slides until it gets there."""
+        if not self.pin_states.get("pos1"):
+            return
+        moved, hit = self._idle_move(
+            self.pos2_slack_mm + 20.0, self.load_grab_speed, endstop_key="pos2"
+        )
+        if not hit:
+            limit = (path + 50.0) if path else self.load_max_mm
+            more, hit = self._idle_move(
+                max(0.0, limit - moved), self.load_speed, endstop_key="pos2"
+            )
+            moved += more
+        if not hit:
+            raise gcmd.error(
+                "BUFFER_UNLOAD: fed %.0f mm and the slider never compressed, so the"
+                " filament never reached anything. Is it in the buffer gear?" % moved
+            )
+
+    def _unload_extruder(self, gcmd, max_mm, clear):
+        """Synced, in reverse: one continuous retraction, fast out of the hot
+        zone and then steady, so the tip never waits in the heatbreak. The
+        extruder letting go shows as the slider falling to pos1. Returns the
+        gears-to-nozzle estimate (meaningless if the free test then fails)."""
+        run = self.gcode.run_script_from_command
+        fast = min(self.unload_fast_mm, max_mm)
+        run("SAVE_GCODE_STATE NAME=_buffer_unload\nM83\nM400")
+        self._do_sync(True)
+        try:
+            if self.unload_ram_mm > 0.0:
+                # a little forward first, so the tip leaves from fresh melt
+                run("G1 E%.3f F300\nM400" % self.unload_ram_mm)
+            e_start = self._extruder_pos(self.reactor.monotonic())
+            self._set_reverse(True, clear)
+            run(
+                "G1 E-%.3f F%.1f\nG1 E-%.3f F%.1f\nM400"
+                % (fast, self.unload_fast_speed * 60.0,
+                   max_mm - fast, self.unload_speed * 60.0)
+            )
+            self._settle()
+            release = self.ctrl.release_e
+        finally:
+            self._do_sync(False)
+            run("RESTORE_GCODE_STATE NAME=_buffer_unload")
+        if release is None:
+            raise gcmd.error(
+                "BUFFER_UNLOAD: the extruder never let go of the filament in %.0f mm"
+                " of retraction. Stopped, nothing pulled. The tip may be caught below"
+                " the gears, or MAX= is too short" % max_mm
+            )
+        # the slider shows the release only after falling from pos2 to the top
+        # of pos1, which takes the slack between the two
+        return (e_start - release) - (self.pos2_slack_mm - self.pos1_slack_mm)
+
+    def _free_test(self, gcmd, test):
+        """A free tip slides forward without compressing the slider. One held
+        above the gears (a swollen tip at the PTFE, say) compresses it past
+        the top of pos1. Checked before any long pull."""
+        moved, hit = self._idle_move(test, self.load_grab_speed, endstop_key="pos2")
+        self._settle()
+        if hit or not self.pin_states.get("pos1"):
+            raise gcmd.error(
+                "BUFFER_UNLOAD: the tip is not free. Feeding %.0f mm compressed the"
+                " slider, so something above the extruder gears still holds it"
+                " (often a swollen tip that won't enter the PTFE). Stopped before the"
+                " long pull: take it out at the toolhead" % test
             )
 
     # --- calibration -----------------------------------------------------
@@ -1301,6 +1674,15 @@ class FilamentBuffer:
 
     def cmd_BUFFER_CALIBRATE(self, gcmd):
         self._require_not_printing(gcmd, "BUFFER_CALIBRATE")
+        # the buffer has to hold while the extruder pulls, so it stays powered
+        self.keep_motor = True
+        try:
+            self._calibrate(gcmd)
+        finally:
+            self.keep_motor = False
+            self._motor_off()
+
+    def _calibrate(self, gcmd):
         runs = gcmd.get_int("RUNS", 3, minval=1, maxval=10)
         speed = gcmd.get_float("SPEED", 4.0, above=0.0, maxval=20.0)
         espeed = gcmd.get_float("EXTRUDE_SPEED", 2.0, above=0.0, maxval=10.0)
@@ -1627,6 +2009,7 @@ class FilamentBuffer:
             lines = self._stats_lines() + self._test_verdict(aborted)
             if not was_synced and self.synced:
                 self._do_sync(False)
+                self._motor_off()
             run("RESTORE_GCODE_STATE NAME=_buffer_test")
         gcmd.respond_info("\n".join("buffer test: " + l for l in lines))
 
@@ -1642,7 +2025,10 @@ class FilamentBuffer:
             "faults_armed": c.faults_enabled,
             "base_rotation_distance": self.base_rd or 0.0,
             "loading": self.loading,
+            "unloading": self.unloading,
             "last_load_mm": self.last_load_mm or 0.0,
+            "path_mm": self.path_mm or 0.0,
+            "nozzle_mm": self.nozzle_mm or 0.0,
         }
         status.update(self.pin_states)
         return status

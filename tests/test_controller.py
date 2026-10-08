@@ -529,3 +529,99 @@ class TestSimulatedPrints(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseSim(BufferSim):
+    """Unloading: the extruder grips until it has retracted `grip` mm. After
+    that the far end is free, so the spring relaxes and the buffer's pull
+    moves the tip up the tube instead of the slider."""
+
+    def __init__(self, ctrl, grip, **kw):
+        super().__init__(ctrl, **kw)
+        self.grip = grip
+        self.tip_up = 0.0
+
+    def step(self, v):
+        if self.E > -self.grip:
+            return super().step(v)
+        dE = v * self.dt
+        self.E += dE
+        self.t += self.dt
+        self.hist.append((self.t, self.E))
+        while self.pending and self.pending[0][0] <= self.t:
+            self.applied = self.pending.pop(0)[1]
+        pull = -self.applied * dE
+        take = min(self.x, pull)
+        self.x = max(0.0, self.x - take)
+        self.tip_up += pull - take
+        for name in ("pos1", "pos2", "pos3"):
+            s = self.sensors[name]
+            if s.update(self.x):
+                self.ctrl.on_sensor(name, s.state, -1, self.E)
+                self._note_rate()
+        if self.t >= self.next_tick:
+            self.next_tick += 0.1
+            self.ctrl.on_progress(self.E)
+            self._note_rate()
+
+
+def synced_retract(x0, reverse, ratio_err=0.0, mm=120.0, speed=20.0):
+    ctrl = new_ctrl()
+    sim = BufferSim(ctrl, x0=x0, ratio_err=ratio_err, faults=False)
+    if reverse:
+        ctrl.set_reverse(True, 0.0, clear_mm=49.0)
+    xs = []
+    steps = int(mm / speed / 0.025)
+    for _ in range(steps):
+        sim.run(-speed, 0.025)
+        xs.append(sim.x)
+    return sim, min(xs), max(xs)
+
+
+class TestReverse(unittest.TestCase):
+    """Slack changes by (m - 1) * dE whichever way the extruder runs. Forward
+    multipliers on a retraction push the slider further the wrong way."""
+
+    def test_multipliers_mirror_around_one(self):
+        c = new_ctrl()
+        c.set_reverse(True, 0.0)
+        for zone, forward in ((ZONE_POS1, c.m_pos1), (ZONE_POS3, c.m_pos3), (ZONE_POS2, c.m_target)):
+            c.zone, c.approach = zone, False
+            self.assertAlmostEqual(c.multiplier(), 2.0 - forward)
+
+    def test_forward_logic_on_a_retraction_pulls_against_the_extruder(self):
+        # starting below pos2 (what happened on the printer on 2026-10-08)
+        for x0, err in ((10.0, 0.0), (10.0, -0.03), (24.0, 0.03)):
+            sim, lo, hi = synced_retract(x0, reverse=False, ratio_err=err)
+            self.assertGreater(sim.tug_total, 25.0, (x0, err))
+
+    def test_reverse_mode_holds_the_slider_and_never_tugs(self):
+        for x0, err in ((10.0, 0.0), (10.0, -0.03), (24.0, 0.03), (31.0, 0.0), (31.0, 0.03)):
+            sim, lo, hi = synced_retract(x0, reverse=True, ratio_err=err)
+            self.assertEqual(sim.tug_total, 0.0, (x0, err))
+            self.assertEqual(sim.ground_mm, 0.0, (x0, err))
+            self.assertLess(abs(sim.x - 29.5), 3.0, "ends back near the lower edge of pos2")
+
+    def test_release_is_seen_then_the_buffer_pulls_clear_and_holds(self):
+        ctrl = new_ctrl()
+        sim = ReleaseSim(ctrl, grip=65.0, x0=29.5, faults=False)
+        ctrl.set_reverse(True, 0.0, clear_mm=49.0)
+        sim.run(-35.0, 25.0 / 35.0)
+        sim.run(-20.0, 105.0 / 20.0)
+        self.assertIsNotNone(ctrl.release_e)
+        # seen once the slider has fallen from pos2 to the top of pos1
+        self.assertAlmostEqual(-ctrl.release_e - 9.6, 65.0, delta=3.0)
+        # clear_mm takes up the 19 mm left in pos1, then moves the tip
+        self.assertAlmostEqual(sim.tip_up, 49.0 - 19.0, delta=8.0)
+        self.assertLess(ctrl.multiplier(), 0.01, "holds once clear")
+
+    def test_starting_at_rest_is_not_a_release_and_nothing_is_learned(self):
+        ctrl = new_ctrl()
+        sim = BufferSim(ctrl, x0=5.0, ratio_err=0.04, faults=False)
+        ctrl.set_reverse(True, 0.0, clear_mm=49.0)
+        trim = ctrl.trim
+        self.assertIsNone(ctrl.release_e)
+        for _ in range(200):
+            sim.run(-20.0, 0.025)
+        self.assertEqual(ctrl.trim, trim)
+        self.assertEqual(ctrl.trim_updates, 0)

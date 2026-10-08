@@ -115,12 +115,15 @@ class FakeMover:
         self.stepper = stepper
         self.moves = []
         self.results = []  # scripted (moved, triggered); default full move
+        self.on_move = None  # optional hook(dist), e.g. to change sensors
 
     def move(self, dist, speed, accel, endstop=None, name="sensor", abort=None):
         self.moves.append(
             {"dist": dist, "speed": speed, "endstop": name if endstop else None,
              "abort": abort}
         )
+        if self.on_move is not None:
+            self.on_move(dist)
         if self.results:
             return self.results.pop(0)
         return dist, False
@@ -174,6 +177,25 @@ class FakeStepper:
         self.rd = rd
         self.rd_history.append(rd)
 
+    def get_name(self):
+        return "extruder_stepper buffer"
+
+
+class FakeStepperEnable:
+    def __init__(self):
+        self.calls = []
+
+    def set_motors_enable(self, names, enable):
+        self.calls.append((tuple(names), enable))
+
+
+class FakeSaveVariables:
+    def __init__(self, variables=None):
+        self.variables = dict(variables or {})
+
+    def get_status(self, eventtime):
+        return {"variables": self.variables}
+
 
 class FakeExtruderStepper:
     def __init__(self, toolhead):
@@ -187,7 +209,7 @@ class FakeExtruderStepper:
 
 
 class FakeHeater:
-    can_extrude = True
+    can_extrude = True  # tests flip this on the class for a cold hotend
 
 
 class FakeExtruder:
@@ -254,6 +276,7 @@ class FakePrinter:
             "pins": FakePins(),
             "output_pin buffer_led_run": FakeOutputPin(),
             "output_pin buffer_led_err": FakeOutputPin(),
+            "stepper_enable": FakeStepperEnable(),
         }
         es_wrapper = type("PES", (), {})()
         es_wrapper.extruder_stepper = FakeExtruderStepper(self.toolhead)
@@ -457,7 +480,8 @@ class TestHardRule(unittest.TestCase):
         self.toolhead.lookahead.last = object()
         for name, params in (("BUFFER_MOVE", {"dist": 10}), ("BUFFER_UNSYNC", {}),
                              ("BUFFER_SYNC", {}), ("BUFFER_TEST_EXTRUDE", {"dry_run": 1}),
-                             ("BUFFER_LOAD", {}), ("BUFFER_CALIBRATE", {}),
+                             ("BUFFER_LOAD", {}), ("BUFFER_UNLOAD", {}),
+                             ("BUFFER_CALIBRATE", {}),
                              ("BUFFER_SET", {"rotation_distance": 6.3})):
             # UNSYNC only does anything when synced; SYNC only when unsynced
             self.buf.synced = name == "BUFFER_UNSYNC"
@@ -609,6 +633,168 @@ class TestIdleMoves(unittest.TestCase):
         gcmd = FakeGcmd(check_z=0, length=30)
         self.cmds["BUFFER_TEST_EXTRUDE"](gcmd)
         self.assertTrue(any("RESULT" in r for r in gcmd.responses))
+
+
+class TestLoadUnload(unittest.TestCase):
+    """Loading and unloading work from sensor events with distance margins:
+    the extruder letting go, the free test, the measured path lengths."""
+
+    def setUp(self, extra=None):
+        self.printer, self.buf = make_buffer(extra)
+        self.pins = self.printer.objects["buttons"].pins
+        self.cmds = self.printer.objects["gcode"].commands
+        self.gcode = self.printer.objects["gcode"]
+        self.mover = self.buf.mover
+        self.enable = self.printer.objects["stepper_enable"]
+        self.press("!buffer:PB7", 1)  # filament at the inlet
+
+    def press(self, pin, state):
+        self.printer.reactor.now += 0.05
+        self.pins[pin](self.printer.reactor.now, state)
+
+    def slider(self, pos1, pos2, pos3):
+        for pin, state in (("buffer:PB4", pos1), ("buffer:PB3", pos2), ("buffer:PB2", pos3)):
+            self.press(pin, state)
+
+    def release_on_retract(self, after_mm=75.0):
+        """The extruder lets go during the reverse retraction."""
+        orig = self.gcode.run_script_from_command
+
+        def run(script):
+            orig(script)
+            if "G1 E-" in script and self.buf.ctrl.reverse:
+                self.slider(1, 0, 0)
+                self.buf.ctrl.release_e = -after_mm
+
+        self.gcode.run_script_from_command = run
+
+    def test_unload_retracts_in_reverse_tests_then_parks(self):
+        self.setUp({"path_mm": 900})
+        self.slider(0, 1, 0)  # held at pos2: the filament is in the extruder
+        self.release_on_retract(75.0)
+        self.cmds["BUFFER_UNLOAD"](FakeGcmd(temp=210))
+        scripts = self.gcode.scripts
+        self.assertIn("M109 S210.0", scripts)
+        self.assertIn("G1 E3.000 F300\nM400", scripts)
+        # one continuous retraction: fast out of the hot zone, then steady
+        self.assertIn("G1 E-25.000 F2100.0\nG1 E-175.000 F1200.0\nM400", scripts)
+        test, pull = self.mover.moves
+        self.assertEqual((test["dist"], test["endstop"]), (22.0, "pos2"))
+        # the tip ends about clear - pos1 slack - test = 8 mm above the gears
+        self.assertAlmostEqual(pull["dist"], -(900.0 - 8.0 - 50.0))
+        self.assertAlmostEqual(self.buf.nozzle_mm, 75.0 - (28.6 - 19.0))
+        self.assertFalse(self.buf.synced)
+        self.assertFalse(self.buf.unloading)
+        self.assertEqual(self.enable.calls[-1], (("extruder_stepper buffer",), False))
+
+    def test_unload_eject_pulls_past_the_buffer_gear(self):
+        self.setUp({"path_mm": 900})
+        self.slider(0, 1, 0)
+        self.release_on_retract()
+        self.cmds["BUFFER_UNLOAD"](FakeGcmd(eject=1))
+        self.assertAlmostEqual(self.mover.moves[-1]["dist"], -(900.0 - 8.0 + 60.0))
+
+    def test_a_stuck_tip_stops_before_the_long_pull(self):
+        self.setUp({"path_mm": 900})
+        self.slider(0, 1, 0)
+        self.release_on_retract()
+        # the free test compresses the slider: something still holds the tip
+        self.mover.on_move = lambda dist: dist > 0 and self.slider(0, 0, 0)
+        with self.assertRaises(CommandError) as ctx:
+            self.cmds["BUFFER_UNLOAD"](FakeGcmd())
+        self.assertIn("not free", str(ctx.exception))
+        self.assertEqual([m["dist"] for m in self.mover.moves], [22.0])
+        self.assertIsNone(self.buf.nozzle_mm, "a failed unload must not store a length")
+        self.assertFalse(self.buf.synced)
+
+    def test_no_release_means_no_pull(self):
+        self.slider(0, 1, 0)
+        with self.assertRaises(CommandError) as ctx:
+            self.cmds["BUFFER_UNLOAD"](FakeGcmd())
+        self.assertIn("never let go", str(ctx.exception))
+        self.assertEqual(self.mover.moves, [])
+        self.assertFalse(self.buf.synced)
+        self.assertFalse(self.buf.ctrl.reverse)
+
+    def test_a_relaxed_slider_finds_the_tip_first(self):
+        self.setUp({"path_mm": 900})
+        self.slider(1, 0, 0)  # at rest: is anything holding the far end?
+        self.mover.results = [(28.6, True)]
+        self.release_on_retract()
+        self.cmds["BUFFER_UNLOAD"](FakeGcmd())
+        find = self.mover.moves[0]
+        self.assertEqual(find["endstop"], "pos2")
+        self.assertGreater(find["dist"], 0.0)
+
+    def test_without_a_path_length_it_stops_once_free(self):
+        self.slider(0, 1, 0)
+        self.release_on_retract()
+        gcmd = FakeGcmd()
+        self.cmds["BUFFER_UNLOAD"](gcmd)
+        self.assertEqual([m["dist"] for m in self.mover.moves], [22.0])
+        self.assertIn("PATH=", gcmd.responses[-1])
+
+    def test_unload_refusals(self):
+        self.slider(0, 1, 0)
+        self.printer.objects["print_stats"].state = "printing"
+        with self.assertRaises(CommandError):
+            self.cmds["BUFFER_UNLOAD"](FakeGcmd())
+        self.printer.objects["print_stats"].state = "standby"
+        FakeHeater.can_extrude = False
+        try:
+            with self.assertRaises(CommandError) as ctx:
+                self.cmds["BUFFER_UNLOAD"](FakeGcmd())
+            self.assertIn("too cold", str(ctx.exception))
+        finally:
+            FakeHeater.can_extrude = True
+        self.assertEqual(self.mover.moves, [])
+
+    def test_the_motor_switches_off_when_idle(self):
+        off = (("extruder_stepper buffer",), False)
+        self.cmds["BUFFER_MOVE"](FakeGcmd(dist=10))
+        self.assertEqual(self.enable.calls, [off])
+        self.cmds["BUFFER_SYNC"](FakeGcmd())
+        self.assertEqual(self.enable.calls, [off], "never while synced")
+        self.cmds["BUFFER_UNSYNC"](FakeGcmd())
+        self.assertEqual(self.enable.calls, [off, off])
+        printer, buf = make_buffer({"idle_motor_off": "False"})
+        printer.objects["gcode"].commands["BUFFER_MOVE"](FakeGcmd(dist=10))
+        self.assertEqual(printer.objects["stepper_enable"].calls, [])
+
+    def test_a_load_from_the_inlet_measures_the_path_and_saves_it(self):
+        self.printer.objects["save_variables"] = FakeSaveVariables()
+        self.slider(1, 0, 0)
+        self.buf.fresh_insert = True  # as autoload sets it
+        self.mover.results = [(20.0, False), (900.0, True)]
+        self.cmds["BUFFER_LOAD"](FakeGcmd())
+        self.assertAlmostEqual(self.buf.path_mm, 920.0 - 28.6)
+        self.assertIn("SAVE_VARIABLE VARIABLE=buffer_path_mm VALUE=891.4", self.gcode.scripts)
+        # a manual reload from part way doesn't count as a measurement
+        self.slider(1, 0, 0)
+        self.mover.results = [(20.0, False), (300.0, True)]
+        self.cmds["BUFFER_LOAD"](FakeGcmd())
+        self.assertAlmostEqual(self.buf.path_mm, 891.4)
+
+    def test_saved_lengths_are_read_at_startup_and_config_wins(self):
+        printer = FakePrinter()
+        printer.objects["save_variables"] = FakeSaveVariables(
+            {"buffer_path_mm": 880.0, "buffer_nozzle_mm": 66.0})
+        values = dict(BASE_CONFIG)
+        values["nozzle_mm"] = 70
+        buf = fb.FilamentBuffer(FakeConfig(printer, values))
+        printer.send_event("klippy:connect")
+        printer.send_event("klippy:ready")
+        self.assertEqual((buf.path_mm, buf.nozzle_mm), (880.0, 70.0))
+
+    def test_load_to_nozzle_feeds_the_estimate_plus_a_margin_then_purges(self):
+        self.setUp({"nozzle_mm": 65})
+        self.slider(0, 1, 0)  # tip already at the gears
+        self.cmds["BUFFER_LOAD"](FakeGcmd(to="nozzle", purge=30, temp=210))
+        fed = [s for s in self.gcode.scripts if s.startswith("G1 E") and "E-" not in s]
+        total = sum(float(s.split()[1][1:]) for s in fed)
+        self.assertAlmostEqual(total, 10.0 + (65.0 + 15.0 - 10.0) + 30.0)
+        self.assertTrue(fed[0].startswith("G1 E10.000 F120"), "grab the tip slowly first")
+        self.assertFalse(self.buf.synced)
 
 
 class TestCalibrationMath(unittest.TestCase):

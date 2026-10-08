@@ -178,6 +178,9 @@ one bounded tug:
 \text{tug} \le (m_1\,g - 1)\,\ell \approx 0.5\ \text{mm for } \ell = 1\ \text{mm}
 ```
 
+That bound is fine for a 1 mm print retraction, and wrong for a 100 mm unload. Long retractions
+get their own section: [11](#11-unloading-running-it-backwards).
+
 ## 7. Debounce and rate limiting
 
 A sensor edge at extruder position $E_0$ counts only once the extruder has travelled
@@ -280,3 +283,69 @@ Loading, the buttons and calibration move the buffer on its own (never while pri
 
   which is 3 mm at the 20 mm/s button speed. Before this change, button moves were queued up to
   2 s ahead and kept going long after the button was released.
+
+## 11. Unloading: running it backwards
+
+The plant equation from section 2 doesn't care which way the extruder runs:
+
+```math
+dx = (g\,m - 1)\,dE
+```
+
+The zone multipliers were picked for $`dE > 0`$. In pos1 the slider needs slack, so $`m_1 > 1`$
+makes $`dx`$ positive. Flip the sign of $`dE`$ and the same $`m_1`$ makes $`dx`$ negative: the
+correction now drives the slider further the wrong way. A print retraction is too short for that to
+matter (section 6). An unload is not. In the simulation, a 120 mm synced retraction that starts
+below pos2 with the forward multipliers pulls 30 to 50 mm of filament against the extruder's grip,
+which is grinding, plain and simple.
+
+The fix keeps the correction's sign by mirroring each multiplier around 1 while unloading:
+
+```math
+m'(z) = \max\big(0.05,\ 2 - m(z)\big) \quad\Longrightarrow\quad dx = \big(g\,m' - 1\big)\,dE \approx \big(m(z) - 1\big)\,|dE|
+```
+
+So pos1 gets $`m_1' = 0.5`$ (the buffer retracts half as fast and the slider gains slack), pos3 gets
+$`m_3' = 1.7`$, and pos2 gets $`1.01`$. The same simulation then never pulls against the extruder,
+from any start position and with ratio errors of $`\pm 3\%`$, and the slider settles back at the
+lower edge of pos2. The trim learns nothing in reverse: its update rules assume forward extrusion.
+
+**The release.** While the extruder holds the filament, the mirrored control keeps the slider near
+$`x_2`$. Once the tip leaves the gears, the extruder takes nothing up and the buffer's pull comes
+straight out of the slider, so $`x`$ falls to $`x_1`$ within about $`x_2 - x_1 = 9.6`$ mm of
+extruder travel. That pos1 edge is the release. The gears-to-nozzle length follows from where it
+happened:
+
+```math
+L_n \approx \big(E_{start} - E_{release}\big) - (x_2 - x_1)
+```
+
+The simulation puts it within 3 mm of the true value.
+
+**Pulling clear, then holding.** After the release the buffer runs 1:1 for `clear` mm of extruder
+travel, then drops to $`m = 0.001`$ and holds while the extruder finishes. The first $`x_1`$ of that
+comes out of the slider, so the tip ends up $`c - x_1`$ above the gears. With $`c = 49`$ that's
+about 30 mm. If the tip is stuck, the buffer slips for at most $`c - x_1`$ plus a little latency,
+not the whole retraction.
+
+**The free test.** Feeding $`f`$ mm with the far end free just slides the filament, and the slider
+stays relaxed. With the far end held, all of it lands in the slider. Choose
+
+```math
+x_1 < f < c - x_1
+```
+
+so a held tip pushes the slider out of pos1 and a free one can't reach the gears. The defaults are
+$`f = x_1 + 3 = 22`$ and $`c = x_1 + f + 8 = 49`$, which leaves the free tip about 8 mm above the
+gears after the test.
+
+**Where the tip ends up.** With the inlet-to-gears path $`L_p`$ measured by an autoload (the fed
+distance minus the $`x_2`$ of slack the slider holds at pos2), the final pull is
+
+```math
+\text{park: } L_p - (c - x_1 - f) - p, \qquad \text{eject: } L_p - (c - x_1 - f) + 60
+```
+
+with $`p = 50`$ mm. None of these lengths has to be exact. A 20 mm error in $`L_p`$ moves the
+parked tip by 20 mm inside a 50 mm margin, an eject that pulls too far just spins the buffer gear,
+and a load that feeds too far purges a little more.

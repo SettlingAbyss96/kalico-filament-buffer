@@ -191,7 +191,41 @@ the stop. A move can also end on a host condition, such as a released button, ch
 buffer, i.e. the slider resting at pos1). It feeds 20 mm at 10 mm/s so the gear catches filament
 that is still being pushed in, then up to `load_max_mm` at 30 mm/s, and stops at pos2: the tip has
 reached the extruder gears and the slider is compressed to its target. Either button cancels. If
-pos2 is never reached, the gear probably never gripped the filament.
+pos2 is never reached, the gear probably never gripped the filament. A load that starts from an
+empty path also measures it: everything fed beyond the slack the slider now holds is the path
+from the inlet to the extruder gears.
+
+`BUFFER_LOAD TO=nozzle` carries on from there with the buffer synced: 10 mm at 2 mm/s so the gears
+grab the tip, then the gears-to-nozzle length plus a 15 mm margin, then the purge. Feeding too far
+only purges a bit more, so the margin is cheap. Every 10 mm it checks the slider, and if it sits
+at pos3 the extruder isn't taking the filament and the load stops.
+
+**Unloading** (`BUFFER_UNLOAD`) is loading run backwards, and every step ends on a sensor event,
+not a distance:
+
+1. **Find the tip.** A slider held out of pos1 means the far end is held, so the filament is in the
+   extruder. At rest, the buffer feeds until pos2, which puts the tip at the gears
+2. **Retract, synced, in reverse.** A small push first so the tip leaves from fresh melt, then one
+   continuous retraction: 25 mm at 35 mm/s out of the hot zone, then 20 mm/s. No stops while the tip
+   is in the heatbreak, which is how a soft tip swells and jams. The zone multipliers are mirrored
+   around 1 for this ([CONTROL.md, section 11](CONTROL.md#11-unloading-running-it-backwards))
+3. **The release.** When the tip leaves the gears the extruder stops taking filament up and the
+   slider falls to pos1. That edge marks the release and measures the gears-to-nozzle length. The
+   buffer then pulls the tip clear (49 mm) and holds, while the extruder finishes its retraction
+4. **The free test.** The buffer feeds 22 mm. A free tip just slides, so the slider stays in pos1.
+   A tip stuck above the gears (a swollen one that won't enter the PTFE, say) compresses it past the
+   top of pos1. Stuck means stop, with nothing pulled further
+5. **Pull back** the measured path minus a 50 mm park, so the tip stays in the buffer gear ready to
+   reload, or past the gear with `EJECT=1`
+
+The extruder may retract more than it needs to. That costs nothing: once the tip is gone its gears
+just spin, and the buffer is holding by then.
+
+**Motor power.** The buffer motor is switched off whenever it is idle and unsynced, and Kalico
+switches it back on at its next step. Held at the full 0.49 A it heated the closed buffer box to
+about 57 °C at the board with nothing moving. The stock firmware switched the motor off after
+every move too. While synced it stays on (it moves with every extrusion); a `hold_current` on the
+driver covers the standstills during a print.
 
 **Buttons.** Holding FEED or RETRACT runs one continuous move that ends when the button is released.
 FEED also ends at pos3. That way, holding the button too long can't push the filament against a
@@ -216,8 +250,8 @@ printed for the config, with the gap and band widths.
 
 | Layer | What it proves |
 |---|---|
-| `tests/test_controller.py` (26 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs |
-| `tests/test_adapter.py` (23 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; calibration math; config defaults equal the simulated values |
+| `tests/test_controller.py` (31 tests) | A physical model of the slider, with the measured LLL Plus geometry, drives the real controller: retractions up to 1 mm at 25 to 45 mm/s, flow up to 15 mm/s, ratio errors of ±4%, sensor noise, slow rate application, other geometries in both layouts, a mid-print filament change, a slipping gear, a clog, soak runs. Unloading: forward multipliers on a long retraction pull against the extruder, mirrored ones never do, the release is seen within a few mm, the buffer pulls clear and holds |
+| `tests/test_adapter.py` (34 tests) | No motion-queue calls or buffer moves mid-print; commands that would stop the toolhead are refused while printing; loading, buttons and autoload behave; the unload sequence, a stuck tip stopping before the long pull, no release meaning no pull; the motor switching off when idle; path lengths measured and saved; calibration math; config defaults equal the simulated values |
 | `config/buffer-test.cfg` | Hardware: sensors, TMC link, LEDs, sync, motor direction |
 | `BUFFER_TEST_EXTRUDE` | Synced extrusion into the air at several speeds with 1 mm retractions. Checks the buffer every 25 mm and aborts safely when filament isn't consumed, isn't fed, or runs out |
 | Planned | A full test print with the buffer active: `print_stall` stays 0 and print time matches a run without it |
@@ -228,17 +262,13 @@ printed for the config, with the gap and band widths.
 
 | | Measures | Method |
 |---|---|---|
-| C1 | Path length, inlet to extruder gears | `BUFFER_LOAD` already reports the fed distance; store it for faster loads and the runout deadline |
+| C1 | Path length, inlet to extruder gears | Done: measured by every autoload, kept with `SAVE_VARIABLE` |
 | C2 | Extruder grab point | with the tip at the gears, step the extruder until the slider responds; repeat back and forth |
 | C3 | Slider position between sensors | from the measured geometry, to remove the one-off excursions when a very different filament is first loaded |
-| C5 | Extruder gears to nozzle | from toolhead geometry (60 mm working estimate for a Galileo 2 with a Phaetus Conch); load purges absorb the error |
+| C5 | Extruder gears to nozzle | Done: measured by every `BUFFER_UNLOAD` from the release. A pressure sensor at the nozzle could confirm it on the way in |
 
-**Finishing the load and the unload** (idle only).
-- **Materials:** a table of fixed load temperatures per material.
-- **Load to the nozzle:** after `BUFFER_LOAD`, heat, let the extruder grab, sync, extrude to the
-  nozzle, then purge, retract slightly and clean the nozzle through a hook macro.
-- **`BUFFER_UNLOAD`:** clear the extruder, then retract until the tip sits just past the buffer gear,
-  still gripped and ready to reload. There is no spool rewinder, so only the minimum is pulled back.
+**Load temperatures** come from the printer's own filament settings, not a table in here. The
+plugin takes `TEMP=` and leaves the choice to the macro that calls it.
 
 **Runout deadline.** On runout, track the old tail and pause only at the last safe point before it
 reaches the extruder gears, instead of immediately.
