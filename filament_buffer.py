@@ -29,6 +29,7 @@ DEFAULT_NOZZLE_MM = 100.0  # gears to nozzle until BUFFER_UNLOAD measures it
 NOZZLE_MARGIN_MM = 15.0  # extra feed past the nozzle estimate on a load
 MIN_NOZZLE_MM = 20.0  # a shorter release means the filament wasn't in the hotend
 MIN_PATH_MM = 100.0  # a shorter autoload isn't a full path measurement
+PATH_AGREE_MM = 50.0  # a new path reading this far off the known one isn't saved
 
 # Unloading runs the buffer at a fixed multiplier, not the zone control: the
 # slider stays relaxed so nothing presses the tip into the gears (DESIGN.md)
@@ -828,6 +829,9 @@ class FilamentBuffer:
         self.unloading = False
         self.keep_motor = False  # sequences that need the motor held between moves
         self.fresh_insert = False  # the next load starts with the tip at the inlet
+        # Klipper reports every input at startup. Only an inlet seen empty and
+        # then filled is an insert; filament that was already there is not
+        self.inlet_was_empty = False
         self.load_cancel = False
         self.inlet_clear_since = None
         self.last_load_mm = None
@@ -1061,7 +1065,10 @@ class FilamentBuffer:
                 self._update_leds()
                 if state:
                     self._maybe_autoload(eventtime)
-                elif self.synced and self.mcu is not None:
+                    self.inlet_was_empty = False
+                else:
+                    self.inlet_was_empty = True
+                if not state and self.synced and self.mcu is not None:
                     # arm/disarm now rather than waiting for the next tick
                     self.ctrl.set_faults_enabled(
                         self._faults_should_be_enabled(), self._extruder_pos(eventtime)
@@ -1166,6 +1173,8 @@ class FilamentBuffer:
     def _maybe_autoload(self, eventtime):
         if not self.autoload or self.synced or self.loading:
             return
+        if not self.inlet_was_empty:
+            return  # present at startup, not an insert
         if self._print_state() in ("printing", "paused"):
             return
         # Only into an empty path: the slider rests at pos1 with no filament
@@ -1373,10 +1382,19 @@ class FilamentBuffer:
             # beyond the slack it now holds is the path itself
             path = moved - self.pos2_slack_mm
             if measure and at_rest and path >= MIN_PATH_MM:
-                gcmd.respond_info(
-                    "buffer: path from the inlet to the extruder gears is about %.0f mm" % path
-                )
-                self._remember(gcmd, "path", path)
+                if self.path_mm and abs(path - self.path_mm) > PATH_AGREE_MM:
+                    # e.g. a broken piece still in the tube ahead of the new tip
+                    gcmd.respond_info(
+                        "buffer: this load says the path is about %.0f mm, but it's"
+                        " known to be %.0f mm. Something was already in the tube"
+                        " ahead of the tip, so it wasn't saved" % (path, self.path_mm)
+                    )
+                else:
+                    gcmd.respond_info(
+                        "buffer: path from the inlet to the extruder gears is about"
+                        " %.0f mm" % path
+                    )
+                    self._remember(gcmd, "path", path)
             return True
         if self.load_cancel:
             gcmd.respond_info("buffer: load cancelled after %.0f mm" % moved)
@@ -1506,11 +1524,14 @@ class FilamentBuffer:
                 pull = self.pos2_slack_mm + path - park
             self._idle_move(-min(pull, JOG_MAX_MM), self.load_speed)
             gcmd.respond_info(
-                "buffer: unloaded, %s"
+                "buffer: unloaded, %s. About %.0f mm of filament went back out of"
+                " the inlet toward the spool, which doesn't turn by itself: wind it"
+                " back before loading again, or it tangles"
                 % (
-                    "the tip is out past the buffer gear (wind the spool back)"
+                    "the tip is out past the buffer gear"
                     if eject
-                    else "the tip is parked about %.0f mm past the buffer inlet" % park
+                    else "the tip is parked about %.0f mm past the buffer inlet" % park,
+                    pull - self.pos2_slack_mm,
                 )
             )
         finally:

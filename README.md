@@ -113,7 +113,8 @@ The derivations, assumptions and where every default comes from are in
 
 ## Loading and calibration
 
-- **Loading:** insert filament at the buffer inlet. After a second the buffer feeds it, slowly for
+- **Loading:** insert filament at the buffer inlet (filament already there when Klipper starts
+  doesn't count as an insert). After a second the buffer feeds it, slowly for
   the first 20 mm so the gear catches it, then at 30 mm/s, until the slider reaches pos2. That
   means the tip is pressed against the extruder gears. pos2 and pos3 double as endstops on the
   buffer MCU, so the motor stops the moment a sensor trips. Press either buffer button to cancel.

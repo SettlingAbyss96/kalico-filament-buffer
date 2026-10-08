@@ -551,10 +551,17 @@ class TestIdleMoves(unittest.TestCase):
 
     def test_inserting_filament_into_an_empty_path_starts_a_load(self):
         self.press("buffer:PB4", 1)  # slider at rest
-        self.press("!buffer:PB7", 1)  # filament inserted
+        self.press("!buffer:PB7", 0)  # inlet empty...
+        self.press("!buffer:PB7", 1)  # ...then filament inserted
         self.assertEqual(len(self.printer.reactor.callbacks), 1)
         self.run_callbacks()
         self.assertIn("BUFFER_LOAD", self.printer.objects["gcode"].scripts)
+
+    def test_filament_already_there_at_startup_is_not_an_insert(self):
+        # Klipper reports the inlet's state at startup: present, slider at rest
+        self.press("buffer:PB4", 1)
+        self.press("!buffer:PB7", 1)
+        self.assertEqual(self.printer.reactor.callbacks, [])
 
     def test_no_autoload_when_the_path_is_not_empty_or_disabled(self):
         self.press("!buffer:PB7", 1)  # pos1 not blocked: filament already in
@@ -562,6 +569,7 @@ class TestIdleMoves(unittest.TestCase):
         printer, buf = make_buffer({"autoload": "False"})
         pins = printer.objects["buttons"].pins
         pins["buffer:PB4"](100.1, 1)
+        pins["!buffer:PB7"](100.15, 0)
         pins["!buffer:PB7"](100.2, 1)
         self.assertEqual(printer.reactor.callbacks, [])
 
@@ -667,7 +675,9 @@ class TestLoadUnload(unittest.TestCase):
         self.setUp({"path_mm": 900})
         self.slider(0, 1, 0)  # held at pos2: the filament is in the extruder
         self.held_unload(fed_contact=88.6)
-        self.cmds["BUFFER_UNLOAD"](FakeGcmd(temp=210))
+        gcmd = FakeGcmd(temp=210)
+        self.cmds["BUFFER_UNLOAD"](gcmd)
+        self.gcmd_last = gcmd.responses[-1]
         scripts = self.gcode.scripts
         self.assertIn("M109 S210.0", scripts)
         self.assertIn("G1 E3.000 F300\nM400", scripts)
@@ -677,6 +687,7 @@ class TestLoadUnload(unittest.TestCase):
         self.assertAlmostEqual(dists[2], -(28.6 - 2.0), msg="relax before retracting")
         self.assertEqual((dists[3], self.mover.moves[3]["endstop"]), (22.0, "pos2"))
         self.assertAlmostEqual(dists[-1], -(28.6 + 900.0 - 50.0), msg="pull from contact")
+        self.assertIn("850 mm of filament went back", self.gcmd_last)
         # the buffer followed a hair faster than the extruder during the retraction
         self.assertIn(6.3 / fb.UNLOAD_FOLLOW, self.buf.mcu_stepper.rd_history)
         # the tip ended 88.6 - 28.6 + 22 = 82 mm above the gears
@@ -769,6 +780,14 @@ class TestLoadUnload(unittest.TestCase):
         self.mover.results = [(20.0, False), (300.0, True)]
         self.cmds["BUFFER_LOAD"](FakeGcmd())
         self.assertAlmostEqual(self.buf.path_mm, 891.4)
+        # nor does an insert that pushes a broken piece ahead of it
+        self.slider(1, 0, 0)
+        self.buf.fresh_insert = True
+        self.mover.results = [(20.0, False), (300.0, True)]
+        gcmd = FakeGcmd()
+        self.cmds["BUFFER_LOAD"](gcmd)
+        self.assertAlmostEqual(self.buf.path_mm, 891.4)
+        self.assertIn("wasn't saved", gcmd.responses[-1])
 
     def test_saved_lengths_are_read_at_startup_and_config_wins(self):
         printer = FakePrinter()

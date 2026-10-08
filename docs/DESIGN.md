@@ -191,9 +191,13 @@ the stop. A move can also end on a host condition, such as a released button, ch
 buffer, i.e. the slider resting at pos1). It feeds 20 mm at 10 mm/s so the gear catches filament
 that is still being pushed in, then up to `load_max_mm` at 30 mm/s, and stops at pos2: the tip has
 reached the extruder gears and the slider is compressed to its target. Either button cancels. If
-pos2 is never reached, the gear probably never gripped the filament. A load that starts from an
-empty path also measures it: everything fed beyond the slack the slider now holds is the path
-from the inlet to the extruder gears.
+pos2 is never reached, the gear probably never gripped the filament. Only a real insert counts:
+the inlet seen empty and then filled. Klipper reports every input at startup, and filament already
+sitting in the inlet then isn't an insert (treating it as one once fed a parked filament a metre
+forward into a pile of loose loops at the spool, and snapped it). A load that starts from an empty
+path also measures it: everything fed beyond the slack the slider now holds is the path from the
+inlet to the extruder gears. A reading more than 50 mm off the known path isn't saved, since that
+means something was already in the tube ahead of the tip, like a broken piece.
 
 `BUFFER_LOAD TO=nozzle` carries on from there with the buffer synced: 10 mm at 2 mm/s so the gears
 grab the tip, then the gears-to-nozzle length plus a 15 mm margin, then the purge. Feeding too far
@@ -222,7 +226,9 @@ relaxed, and every distance comes from a sensor event:
    any estimate, and, since the buffer carried the tip 1.02 times the overrun past the gears, it
    also gives the gears-to-nozzle length
 6. **Pull back** the slack plus the measured path minus a 50 mm park, so the tip stays in the
-   buffer gear ready to reload, or past the gear with `EJECT=1`
+   buffer gear ready to reload, or past the gear with `EJECT=1`. Everything pulled back goes out of
+   the inlet toward the spool, and without a rewinder the spool doesn't turn back by itself, so the
+   unload says how much went and that it wants winding in before the next load
 
 If the tip does stick above the gears, the buffer slips for the overrun at most, about 45 mm once
 the gears-to-nozzle length is known (more the first time, while it's still a guess).
